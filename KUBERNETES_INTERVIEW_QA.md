@@ -12,6 +12,7 @@
   - [Q2. What is CrashLoopBackOff and how do you fix it?](#q2-what-is-crashloopbackoff-and-how-do-you-fix-it)
   - [Q3. What is ImagePullBackOff? How do you fix it?](#q3-what-is-imagepullbackoff-how-do-you-fix-it)
   - [Q4. Difference between CrashLoopBackOff and ImagePullBackOff?](#q4-difference-between-crashloopbackoff-and-imagepullbackoff)
+  - [Q5. What is Taints and Tolerations? What is the difference between these?](#q5-what-is-taints-and-tolerations-what-is-the-difference-between-these)
   - [Scenario 1. ImagePullBackOff — Possible Reasons?](#scenario-1-imagepullbackoff----possible-reasons)
   - [Scenario 2. Same image works for another app — only my app gets ImagePullBackOff](#scenario-2-advanced-same-image-same-tag-same-registry-works-for-another-app-only-your-application-gets-imagepullbackoff-what-could-be-the-reason)
 
@@ -1286,7 +1287,347 @@ Both looked similar from `kubectl get pods` but required completely different in
 
 ---
 
-<!-- Add more questions as Q5, Q6... -->
+#### Q5. What is Taints and Tolerations? What is the difference between these?
+
+**Answer:**
+
+Taints and Tolerations are a Kubernetes mechanism that controls **which pods can be scheduled on which nodes**. They work as a pair — you cannot understand one without the other. But they serve opposite purposes and are applied to opposite things.
+
+---
+
+**Simple real-world analogy before the technical explanation:**
+
+Think of a **VIP lounge at an airport**:
+
+- The **bouncer at the door** is the **Taint** — it repels everyone by default. Only people with the right pass can enter.
+- The **VIP pass** is the **Toleration** — it tells the bouncer "I am allowed in, let me through."
+
+Without the VIP pass (toleration), nobody gets into the VIP lounge (tainted node). With the pass, you are allowed in — but you still might choose to sit in the regular area if you want to.
+
+---
+
+**What is a Taint?**
+
+A **Taint** is applied to a **Node**. It marks the node as special and tells Kubernetes:
+
+> "Do not schedule any pod on this node — UNLESS the pod explicitly says it can tolerate this taint."
+
+A taint has three parts:
+
+```
+key=value:effect
+```
+
+- **key** — the name of the taint (e.g., `dedicated`, `gpu`, `environment`)
+- **value** — the value of the taint (e.g., `monitoring`, `true`, `production`)
+- **effect** — what happens to pods that do NOT tolerate this taint
+
+**How to add a taint to a node:**
+
+```bash
+kubectl taint nodes <node-name> key=value:effect
+
+# Real example — mark a node for GPU workloads only
+kubectl taint nodes aks-gpupool-12345-0 gpu=true:NoSchedule
+
+# Mark a node for monitoring tools only
+kubectl taint nodes aks-nodepool-12345-3 dedicated=monitoring:NoSchedule
+```
+
+**How to remove a taint:**
+
+```bash
+kubectl taint nodes aks-gpupool-12345-0 gpu=true:NoSchedule-
+# The trailing minus (-) removes the taint
+```
+
+**How to see taints on a node:**
+
+```bash
+kubectl describe node <node-name> | grep Taints
+# Output:
+# Taints: gpu=true:NoSchedule
+```
+
+---
+
+**The Three Taint Effects:**
+
+The effect is the most important part of a taint — it defines exactly how the taint repels pods.
+
+---
+
+**Effect 1 — `NoSchedule`**
+
+The strictest effect. Kubernetes will **never schedule** a new pod on this node unless the pod has a matching toleration.
+
+Pods already running on the node are **not affected** — they continue running. Only new pods are blocked.
+
+```bash
+kubectl taint nodes aks-nodepool-12345-3 dedicated=monitoring:NoSchedule
+```
+
+Use case: You have a dedicated node for monitoring tools (Prometheus, Grafana). You do not want application pods landing there. Taint it with `NoSchedule` so only monitoring pods (with the matching toleration) get scheduled on it.
+
+---
+
+**Effect 2 — `PreferNoSchedule`**
+
+A soft restriction. Kubernetes will **try not to schedule** pods without a matching toleration on this node — but if there is no other option (all other nodes are full), it will still schedule there.
+
+```bash
+kubectl taint nodes aks-nodepool-12345-3 dedicated=monitoring:PreferNoSchedule
+```
+
+Think of it as a preference, not a hard rule. Use when you want to keep a node relatively free for specific workloads but do not want to risk pods being unschedulable.
+
+---
+
+**Effect 3 — `NoExecute`**
+
+The most aggressive effect. It does two things:
+1. **New pods** without a matching toleration will NOT be scheduled on this node
+2. **Existing pods** without a matching toleration will be **evicted** from this node immediately
+
+```bash
+kubectl taint nodes aks-nodepool-12345-3 maintenance=true:NoExecute
+```
+
+Use case: You are taking a node down for maintenance. You add `NoExecute` — all pods without a toleration are evicted immediately and rescheduled on other nodes. Only DaemonSet pods with matching tolerations stay.
+
+**`NoExecute` with `tolerationSeconds`:**
+
+You can also allow pods to stay on the node for a grace period before eviction:
+
+```yaml
+tolerations:
+  - key: "maintenance"
+    operator: "Equal"
+    value: "true"
+    effect: "NoExecute"
+    tolerationSeconds: 300    # Stay on the node for 5 more minutes, then get evicted
+```
+
+---
+
+**What is a Toleration?**
+
+A **Toleration** is applied to a **Pod** (in the pod spec). It tells Kubernetes:
+
+> "This pod is allowed to be scheduled on nodes with this specific taint. I can tolerate it."
+
+A toleration matches a taint by key, value, and effect.
+
+**Syntax:**
+
+```yaml
+spec:
+  tolerations:
+    - key: "gpu"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+```
+
+This pod says — "I can tolerate nodes tainted with `gpu=true:NoSchedule`."
+
+**Operators:**
+
+| Operator | Meaning |
+|---|---|
+| `Equal` | Key AND value must match exactly |
+| `Exists` | Only the key needs to match — any value is tolerated |
+
+```yaml
+# Equal — matches only gpu=true:NoSchedule
+tolerations:
+  - key: "gpu"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+
+# Exists — matches any taint with key "gpu" regardless of value
+tolerations:
+  - key: "gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+# Tolerate ALL taints on ALL nodes (empty toleration)
+tolerations:
+  - operator: "Exists"
+# This pod can be scheduled anywhere — even heavily tainted nodes
+# DaemonSets typically use this
+```
+
+---
+
+**The key difference between Taints and Tolerations:**
+
+| | Taint | Toleration |
+|---|---|---|
+| **Applied to** | **Node** | **Pod** |
+| **Purpose** | **Repels** pods — keeps unwanted pods away | **Allows** a pod to be scheduled on a tainted node |
+| **Set by** | Cluster administrator / DevOps engineer | Application developer / deployment spec |
+| **Direction** | Node pushes pods away | Pod says "I can handle this node" |
+| **Command / field** | `kubectl taint nodes` | `spec.tolerations` in pod/deployment YAML |
+
+**Think of it this way:**
+- **Taint** is on the NODE — it is the node saying *"I don't want most pods"*
+- **Toleration** is on the POD — it is the pod saying *"I don't mind going to that node"*
+
+---
+
+**Important — Toleration does NOT force the pod onto a tainted node:**
+
+This is a very important point that many candidates miss.
+
+A toleration only says "I am **allowed** to go to that node." It does NOT say "I **must** go to that node."
+
+If you want a pod to specifically be scheduled ON a tainted node, you need to combine tolerations with **nodeAffinity** or **nodeSelector**. Toleration alone just removes the barrier — it does not create a magnet.
+
+```yaml
+spec:
+  # Toleration removes the barrier (allows scheduling on the GPU node)
+  tolerations:
+    - key: "gpu"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+
+  # nodeSelector creates the magnet (forces scheduling ON the GPU node)
+  nodeSelector:
+    gpu: "true"
+
+  containers:
+    - name: ml-training
+      image: azureshopacr.azurecr.io/ml-trainer:v1.0.0
+```
+
+With both — the pod is scheduled on the GPU node specifically. With only the toleration — it can go there but might end up anywhere.
+
+---
+
+**Real AzureShop Examples:**
+
+**Example 1 — Dedicated Monitoring Node**
+
+In AzureShop, we had a dedicated node pool for monitoring tools — Prometheus, Grafana, and Alertmanager. We did not want application pods landing there and consuming resources needed for monitoring.
+
+**Step 1 — Taint the monitoring nodes:**
+```bash
+kubectl taint nodes aks-monitorpool-12345-0 dedicated=monitoring:NoSchedule
+kubectl taint nodes aks-monitorpool-12345-1 dedicated=monitoring:NoSchedule
+```
+
+**Step 2 — Add tolerations to monitoring deployments:**
+```yaml
+# prometheus-deployment.yaml
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "monitoring"
+      effect: "NoSchedule"
+  nodeSelector:
+    dedicated: monitoring    # Also force it to the monitoring node
+  containers:
+    - name: prometheus
+      image: prom/prometheus:v2.45.0
+```
+
+Result: Only Prometheus, Grafana, and Alertmanager pods (with the toleration) land on monitoring nodes. All application pods (user-service, order-service, etc.) without the toleration cannot be scheduled there.
+
+---
+
+**Example 2 — Node Maintenance with NoExecute**
+
+During AKS node upgrades in AzureShop, we used `NoExecute` to gracefully drain a node:
+
+```bash
+# Step 1 — Cordon the node (stop new pods being scheduled)
+kubectl cordon aks-nodepool-12345-2
+
+# Step 2 — Add NoExecute taint to evict existing pods
+kubectl taint nodes aks-nodepool-12345-2 maintenance=true:NoExecute
+
+# All pods without the maintenance toleration are evicted
+# They get rescheduled on other healthy nodes automatically
+
+# Step 3 — Perform maintenance / upgrade
+# ...
+
+# Step 4 — Remove the taint and uncordon
+kubectl taint nodes aks-nodepool-12345-2 maintenance=true:NoExecute-
+kubectl uncordon aks-nodepool-12345-2
+```
+
+---
+
+**Example 3 — System-level DaemonSets tolerate everything**
+
+Kubernetes system components like `kube-proxy`, `CoreDNS`, and the `azure-cni` plugin run as DaemonSets — they must run on every node, including tainted ones. They use a broad toleration to allow this:
+
+```yaml
+# kube-proxy DaemonSet spec
+tolerations:
+  - operator: Exists    # Tolerates ALL taints — runs everywhere
+```
+
+This is why system pods continue running even on tainted nodes.
+
+---
+
+**How Taints and Tolerations work together — complete flow:**
+
+```
+Scheduler tries to place a pod on a node
+              |
+              ↓
+Does the node have any Taints?
+              |
+         _____|_____
+        |           |
+       NO           YES
+        |           |
+  Schedule       Does the pod have a matching Toleration?
+  normally              |
+                   _____|_____
+                  |           |
+                 YES          NO
+                  |           |
+            Check effect   Taint effect applies:
+            - NoSchedule   NoSchedule → don't schedule here
+            - NoExecute    NoExecute  → evict if already running
+            - PreferNoSchedule → try elsewhere first
+```
+
+---
+
+**`kubectl taint` — quick command reference:**
+
+```bash
+# Add a taint
+kubectl taint nodes <node-name> key=value:NoSchedule
+
+# Remove a taint (add - at the end)
+kubectl taint nodes <node-name> key=value:NoSchedule-
+
+# View taints on all nodes
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+
+# View taints on a specific node
+kubectl describe node <node-name> | grep -A3 Taints
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Taints are applied to nodes and Tolerations are applied to pods — they work as a pair. A Taint on a node repels pods — it tells Kubernetes not to schedule any pod there unless the pod has a matching toleration. A Toleration on a pod says I can handle this taint — I am allowed to be scheduled on that node. The key difference is direction — Taint is the node pushing pods away, Toleration is the pod saying it doesn't mind. There are three taint effects — NoSchedule which blocks new pods from being scheduled, PreferNoSchedule which is a soft preference to avoid the node, and NoExecute which both blocks new pods and evicts existing pods that don't have the toleration. An important point is that a toleration only removes the barrier — it does not force the pod onto the tainted node. To force a pod onto a specific node you combine tolerations with nodeSelector or nodeAffinity. In AzureShop, we used taints to dedicate a monitoring node pool exclusively to Prometheus and Grafana so application pods could never land there and consume monitoring resources."*
+
+---
+
+<!-- Add more questions as Q6, Q7... -->
 
 ---
 
