@@ -24,6 +24,7 @@
   - [Q14. You are reviewing a Terraform Pull Request. How would you review it?](#q14-youre-reviewing-a-terraform-pull-request-how-would-you-review-it)
   - [Q15. Which tools would you use to validate Terraform code before approval?](#q15-which-tools-would-you-use-to-validate-terraform-code-before-approval)
   - [Scenario 1. EC2 instance type manually changed in AWS Console](#scenario-1-someone-manually-changed-an-ec2-instance-type-in-the-aws-console-terraform-detects-drift-what-will-you-do)
+  - [Scenario 1.1 (Bonus). Same scenario on Azure — which tool replaces AWS CloudTrail?](#scenario-11-bonus-same-scenario-but-on-azure--which-tool-do-you-use-instead-of-aws-cloudtrail-to-find-who-made-the-manual-change)
   - [Scenario 2. Fix only one resource without applying complete infrastructure](#scenario-2-your-terraform-deployment-takes-around-one-hour-for-both-plan-and-apply-after-deployment-a-critical-production-issue-is-found-in-only-one-resource-how-will-you-fix-only-that-resource-without-applying-the-complete-infrastructure)
   - [Scenario 3. Will terraform apply -target update the state file?](#scenario-3-if-you-use-terraform-apply--target-will-the-terraform-state-file-also-be-updated)
   - [Scenario 4. Have you used terraform -target in your production project?](#scenario-4-have-you-used-terraform--target-in-your-production-project)
@@ -3604,6 +3605,139 @@ Prevent recurrence
 **Summary (what to say if time is short):**
 
 *"First I would run `terraform plan` to confirm exactly what drifted — in this case the EC2 instance type changed from `t3.medium` to `t3.xlarge`. Then I would check AWS CloudTrail to find out who made the change and when. If the change was unauthorized, I run `terraform apply` to revert it back to the code-defined state. If it was intentional — like an on-call engineer scaling up during an incident — I accept the drift by running `terraform apply -refresh-only` to sync the state, update the code to match, and raise a PR so it is reviewed and tracked in Git. Either way, I then tighten IAM permissions and set up a nightly drift detection pipeline so this is caught early in the future."*
+
+---
+
+#### Scenario 1.1 (Bonus). Same scenario but on Azure — which tool do you use instead of AWS CloudTrail to find who made the manual change?
+
+**Answer:**
+
+This is an excellent follow-up question. The scenario is identical — someone manually changed a resource (for example, changed the VM size in the Azure Portal) and Terraform detects drift. The only difference is the tool we use to investigate **who** made the change.
+
+---
+
+**In AWS → CloudTrail**
+**In Azure → Azure Activity Log**
+
+They are the exact same concept, just different names.
+
+---
+
+**What is Azure Activity Log?**
+
+Azure Activity Log is Azure's built-in audit trail. Every single management operation performed on any Azure resource — whether done via the Azure Portal, Azure CLI, PowerShell, Terraform, or any API call — is automatically recorded in the Activity Log.
+
+You do not need to set it up. It is on by default for every Azure subscription.
+
+---
+
+**Full Azure scenario walkthrough:**
+
+**Step 1 — Terraform detects drift**
+
+```bash
+terraform plan
+
+# Output:
+~ azurerm_virtual_machine.main
+    ~ vm_size = "Standard_D2s_v3" → "Standard_D4s_v3"
+```
+
+Terraform is telling you: the VM size in your code is `D2s_v3` but the actual VM in Azure is now `D4s_v3`. Someone changed it manually.
+
+---
+
+**Step 2 — Go to Azure Activity Log to find who did it**
+
+In the Azure Portal:
+```
+Azure Portal
+  → Search "Activity Log" in the top search bar
+  → Filter:
+       Resource Group : azureshop-rg
+       Time Range     : Last 24 hours
+       Operation      : "Update Virtual Machine"
+  → Click the matching event
+  → Look at the "Caller" field
+```
+
+The **Caller** field shows the exact person — their Azure AD email address (e.g., `john.doe@company.com`).
+
+---
+
+**Step 3 — What information Activity Log gives you**
+
+Every event recorded in Activity Log contains:
+
+| Field | Example |
+|---|---|
+| **Who (Caller)** | `john.doe@company.com` |
+| **What (Operation)** | `Microsoft.Compute/virtualMachines/write` |
+| **When (Event Time)** | `2026-07-19 14:32:11 UTC` |
+| **Which Resource** | `azureshop-vm-prod` |
+| **Result** | `Succeeded` |
+| **From Where** | IP address of the person's machine |
+
+---
+
+**Step 4 — Query with KQL in Log Analytics (for deeper investigation)**
+
+If your Activity Logs are sent to a Log Analytics Workspace (recommended for production), you can query them using KQL:
+
+```kusto
+AzureActivity
+| where TimeGenerated > ago(24h)
+| where OperationNameValue == "MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE"
+| where ActivityStatusValue == "Success"
+| project TimeGenerated, Caller, ResourceGroup, ResourceId, OperationNameValue
+| order by TimeGenerated desc
+```
+
+This gives you a clean table — every VM change in the last 24 hours, with the person's name.
+
+---
+
+**Step 5 — After identifying the person, same decision as always**
+
+```
+Drift detected by Terraform
+          ↓
+Azure Activity Log → Found: john.doe made the change at 14:32 UTC
+          ↓
+Talk to John
+          ↓
+Scenario A — Change was a MISTAKE (unauthorized):
+  Run terraform apply → Reverts VM back to Standard_D2s_v3
+  Inform John: all infra changes must go through Terraform and PR process
+  Tighten Azure RBAC permissions so developers cannot modify production VMs directly
+
+Scenario B — Change was VALID (emergency fix during incident):
+  Accept the drift: terraform apply -refresh-only → state updated
+  Update the Terraform code: vm_size = "Standard_D4s_v3"
+  Raise a PR → Review → Merge
+  Run terraform apply → no actual infra change, just state alignment
+  Drift is now resolved and the change is tracked in Git
+```
+
+---
+
+**AWS CloudTrail vs Azure Activity Log — side by side comparison**
+
+| | AWS | Azure |
+|---|---|---|
+| **Tool name** | CloudTrail | Activity Log |
+| **Default retention** | 90 days | 90 days |
+| **Long-term storage** | S3 Bucket | Log Analytics Workspace |
+| **Query language** | CloudWatch Logs Insights | KQL (Kusto Query Language) |
+| **Where to find it** | CloudTrail Console | Azure Monitor → Activity Log |
+| **Alert on manual changes** | CloudWatch Alarm | Azure Monitor Alert |
+| **Setup required?** | Needs to be enabled | On by default — no setup needed |
+
+---
+
+**Summary (what to say in an interview):**
+
+*"In AWS we use CloudTrail to find who made a manual change. In Azure, the equivalent tool is the Azure Activity Log. It is on by default — no setup needed. Every action taken on any Azure resource is automatically recorded with the caller's identity, the operation name, the resource affected, and the timestamp. For long-term querying, we send these logs to a Log Analytics Workspace and query them using KQL. Once we identify who made the change, we follow the same process — confirm whether the change was intentional or unauthorized, then either revert it or accept it and update the Terraform code."*
 
 ---
 
