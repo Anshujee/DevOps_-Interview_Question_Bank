@@ -30,6 +30,9 @@
   - [Scenario 4. Have you used terraform -target in your production project?](#scenario-4-have-you-used-terraform--target-in-your-production-project)
   - [Scenario 5. Customer wants Read-Only access to an existing Resource Group](#scenario-5-you-have-an-existing-terraform-managed-azure-environment-a-customer-wants-read-only-access-to-an-existing-resource-group-how-would-you-implement-this)
   - [Scenario 6. Terraform Plan detects Drift — Customer confirms valid vs not valid](#scenario-6-suppose-terraform-plan-detects-drift-how-would-you-proceed-and-customer-confirms-the-drift-is-valid-how-would-you-proceed-what-if-the-customer-says-the-drift-is-not-valid)
+- [Interview #2 — Accenture | DevOps Engineer | Technical Round 1](#interview-2)
+  - [Q1. What happens when we run terraform init?](#q1-what-happens-when-we-run-terraform-init)
+  - [Q2. Write a Terraform script to create an EC2 instance in multiple regions](#q2-write-a-terraform-script-to-create-an-ec2-instance-in-multiple-regions)
 
 ---
 
@@ -4984,10 +4987,466 @@ This was **Scenario B** — we immediately ran `terraform apply` to restore the 
 
 ---
 
+## Interview #2
+
+**Company:** Accenture
+**Date:** 05-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Senior DevOps Manager
+
+---
+
+### Questions Asked
+
+#### Q1. What happens when we run terraform init?
+
+**Answer:**
+
+`terraform init` is the very first command you run in any Terraform working directory, and interviewers ask this to see if you understand it as more than just "it sets things up" — it actually does four distinct, separate jobs, and knowing them individually is what separates a surface-level answer from an experienced one. Let me go through each.
+
+---
+
+**The four things `terraform init` does**
+
+| Step | What it does | Where the result goes |
+|---|---|---|
+| **1. Backend initialization** | Reads the `backend` block and configures where the state file will live | Connects to the remote backend (or sets up local state) |
+| **2. Provider plugin installation** | Reads `required_providers`, downloads the matching provider binaries | `.terraform/providers/` |
+| **3. Module installation** | Downloads/copies any child modules referenced in the config | `.terraform/modules/` |
+| **4. Dependency lock file** | Records exact provider versions + checksums for reproducibility | `.terraform.lock.hcl` |
+
+---
+
+**Step 1 — Backend initialization**
+
+Terraform reads the `backend` block in your configuration and connects to wherever state is going to be stored:
+
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = "tfstateazureshop"
+    container_name       = "tfstate"
+    key                  = "prod.terraform.tfstate"
+  }
+}
+```
+
+```
+Initializing the backend...
+
+Successfully configured the backend "azurerm"! Terraform will automatically
+use this backend unless the backend configuration changes.
+```
+
+If you don't define a `backend` block at all, Terraform defaults to storing state as a plain `terraform.tfstate` file locally — fine for learning, never acceptable for a real team, since there's no locking and no shared source of truth.
+
+If the backend configuration has **changed** since the last `init` — a different storage account, a different S3 bucket/key — Terraform detects that and prompts you to migrate existing state into the new backend rather than silently starting fresh:
+
+```
+Backend configuration changed!
+
+Terraform detected that the configuration specified for the backend
+has changed. Do you want to migrate all workspaces to the new backend? (yes/no)
+```
+
+This is an important safety net — I always answer this prompt deliberately, never on autopilot, because answering wrong here can effectively "lose" your existing state from Terraform's point of view (the real state file is still sitting in the old backend, but Terraform stops pointing at it).
+
+---
+
+**Step 2 — Provider plugin installation**
+
+Terraform reads every `required_providers` block across your configuration, resolves version constraints, and downloads the matching plugin binaries from the Terraform Registry (or a private/mirrored registry if you've configured one):
+
+```hcl
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.90"
+    }
+  }
+}
+```
+
+```
+Initializing provider plugins...
+- Finding hashicorp/azurerm versions matching "~> 3.90"...
+- Installing hashicorp/azurerm v3.95.0...
+- Installed hashicorp/azurerm v3.95.0 (signed by HashiCorp)
+```
+
+These binaries land in `.terraform/providers/` — a directory that should always be in `.gitignore`, since it's large, platform-specific, and fully reproducible from the config.
+
+---
+
+**Step 3 — Module installation**
+
+If your root module calls any child modules — local path, Git URL, or Terraform Registry module — `init` resolves and downloads/copies them into `.terraform/modules/`, and writes a manifest to `.terraform/modules/modules.json` recording exactly which source and version each one came from:
+
+```hcl
+module "aks_cluster" {
+  source  = "Azure/aks/azurerm"
+  version = "7.5.0"
+}
+```
+
+```
+Initializing modules...
+Downloading registry.terraform.io/Azure/aks/azurerm 7.5.0 for aks_cluster...
+- aks_cluster in .terraform/modules/aks_cluster
+```
+
+---
+
+**Step 4 — The dependency lock file — the part most people gloss over**
+
+This is the step I make a point of highlighting, because it's the one that actually prevents production incidents. On the **first** `init`, Terraform writes a `.terraform.lock.hcl` file recording the exact provider version and cryptographic checksums it resolved:
+
+```hcl
+provider "registry.terraform.io/hashicorp/azurerm" {
+  version     = "3.95.0"
+  constraints = "~> 3.90"
+  hashes = [
+    "h1:9X2NnfBLVJ0dGkA9pcnw0gwjEE4gCU8pWfvXjZzz8bo=",
+    "zh:0f2ba7...",
+  ]
+}
+```
+
+**This file must be committed to version control.** Every subsequent `terraform init` — on a teammate's laptop or in CI — reads this lock file and installs the *exact same* provider version and verifies it against the *exact same* checksum, rather than re-resolving the version constraint fresh each time. Without it, two engineers running `init` a week apart could silently end up on two different minor versions of the `azurerm` provider, and get different plan output for the *same* `.tf` code with no code change to explain why — which is a genuinely confusing bug to chase down if you don't know the lock file is missing or was gitignored by mistake.
+
+---
+
+**Idempotency and re-running `init`**
+
+`terraform init` is safe to run repeatedly — it's not a one-time setup step, it's something you re-run whenever:
+- You clone the repo fresh, or a CI runner starts with no `.terraform/` directory
+- You add or change a provider or module in the config
+- You change the `backend` block
+- You want to pull in a newer provider version deliberately
+
+Common flags I actually use:
+
+| Flag | What it does |
+|---|---|
+| `-upgrade` | Ignores the lock file's pinned version and re-resolves to the latest version matching the constraint — used deliberately, not by default |
+| `-reconfigure` | Ignores any existing backend state and reinitializes from scratch — useful when a backend config got into a bad state |
+| `-migrate-state` | Explicitly migrates state to a new backend without the interactive prompt — used in CI |
+| `-backend=false` | Skips backend initialization entirely — useful for commands like `terraform providers` where you just need the provider/module info, not a state connection |
+| `-input=false` | Fails instead of prompting interactively — mandatory for CI/CD pipelines |
+
+---
+
+**Real-world example — AzureShop**
+
+Early on at AzureShop, we hit exactly the lock-file problem described above. One engineer had run `terraform init` months earlier and never re-ran it, so their local `.terraform.lock.hcl` was pinned to `azurerm v3.60`. A new team member cloned the repo fresh and ran `init` — but the lock file **was** committed, so they correctly got `v3.60` too, matching everyone else. That part worked as intended.
+
+The actual incident happened the one time someone ran `terraform init -upgrade` locally to pull in a provider fix, applied changes, and then **forgot to commit the updated `.terraform.lock.hcl`**. Our CI pipeline still had the old lock file, so the next `terraform plan` in CI silently reinstalled the *old* provider version — meaning a bug fix the engineer thought was deployed was actually never applied to any pipeline-driven run. We caught it because `terraform plan` in CI showed unexpected changes that didn't match what had been tested locally.
+
+Since then, our PR checklist explicitly includes: **"If `.terraform.lock.hcl` changed, is that intentional and reviewed?"** — a lock file diff in a PR is now something we treat as seriously as a `.tf` resource change, not a noisy file to ignore.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+terraform init does 4 things, every time:
+
+1. Backend init       → connects to (or migrates to) the state backend
+2. Provider install    → downloads plugins matching required_providers
+3. Module install      → downloads/copies any child modules referenced
+4. Lock file           → pins exact provider versions + checksums for
+                          reproducibility across every machine/CI runner
+
+When do I re-run it?
+  → Fresh clone / new CI runner (no .terraform/ directory yet)
+  → Added or changed a provider or module
+  → Changed the backend block (triggers a migration prompt)
+  → Deliberately upgrading a provider (-upgrade, then COMMIT the lock file)
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"`terraform init` does four things: it initializes the backend, connecting to wherever state is going to live and prompting to migrate state if the backend config changed; it downloads the provider plugins matching the version constraints in `required_providers`; it downloads any child modules the configuration references; and — the part people most often forget — it writes or reads `.terraform.lock.hcl`, which pins the exact provider version and checksum so every teammate and every CI run resolves to the identical provider, not just a version that satisfies the constraint. It's safe to re-run any time, and I re-run it whenever I add a provider or module, change the backend, or deliberately upgrade a provider with `-upgrade` — and in that last case, I always make sure the updated lock file gets committed, since a stale committed lock file silently keeps CI on an old provider version even after a local upgrade."*
+
+---
+
+#### Q2. Write a Terraform script to create an EC2 instance in multiple regions
+
+**Answer:**
+
+This is a hands-on question, and the trap most people fall into is trying to solve it with a single `provider "aws"` block and a `count` or `for_each` loop over a list of regions — that doesn't work in Terraform, and knowing *why* it doesn't work is exactly the signal the interviewer is looking for. Let me explain the concept first, then write the actual code.
+
+---
+
+**The core concept — the AWS provider is region-scoped, and provider blocks can't be looped**
+
+Every `provider "aws" {}` block is pinned to exactly one region. Unlike resources, **provider configurations are not resources** — you cannot put `for_each` or `count` on a provider block, and you cannot dynamically generate provider aliases from a variable or a list at plan time. Each region you want to target needs its own **statically declared, aliased provider block**, written out by hand, in the code itself.
+
+```hcl
+provider "aws" {
+  region = "us-east-1"        # default/unaliased provider
+}
+
+provider "aws" {
+  alias  = "eu_west_1"
+  region = "eu-west-1"
+}
+
+provider "aws" {
+  alias  = "ap_south_1"
+  region = "ap-south-1"
+}
+```
+
+This is a real, deliberate Terraform limitation, not a gap in my knowledge of a loop syntax — providers must be resolvable during initialization, before any `for_each`/`count` expressions are evaluated, so they can't depend on values that aren't known that early. I always say this explicitly in the interview because it shows I've actually hit this wall in real code, not just read about `for_each`.
+
+---
+
+**Approach 1 — Provider aliases directly in the root module (fine for a small, fixed number of regions)**
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}
+
+provider "aws" {
+  alias  = "eu_west_1"
+  region = "eu-west-1"
+}
+
+provider "aws" {
+  alias  = "ap_south_1"
+  region = "ap-south-1"
+}
+
+# AMI IDs are region-specific — never hardcode one AMI ID across regions
+data "aws_ami" "amazon_linux_us_east_1" {
+  provider    = aws.us_east_1
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+data "aws_ami" "amazon_linux_eu_west_1" {
+  provider    = aws.eu_west_1
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+data "aws_ami" "amazon_linux_ap_south_1" {
+  provider    = aws.ap_south_1
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_instance" "web_us_east_1" {
+  provider      = aws.us_east_1
+  ami           = data.aws_ami.amazon_linux_us_east_1.id
+  instance_type = "t3.micro"
+  tags = {
+    Name   = "cloudcart-web-us-east-1"
+    Region = "us-east-1"
+  }
+}
+
+resource "aws_instance" "web_eu_west_1" {
+  provider      = aws.eu_west_1
+  ami           = data.aws_ami.amazon_linux_eu_west_1.id
+  instance_type = "t3.micro"
+  tags = {
+    Name   = "cloudcart-web-eu-west-1"
+    Region = "eu-west-1"
+  }
+}
+
+resource "aws_instance" "web_ap_south_1" {
+  provider      = aws.ap_south_1
+  ami           = data.aws_ami.amazon_linux_ap_south_1.id
+  instance_type = "t3.micro"
+  tags = {
+    Name   = "cloudcart-web-ap-south-1"
+    Region = "ap-south-1"
+  }
+}
+
+output "instance_ips" {
+  value = {
+    us_east_1 = aws_instance.web_us_east_1.public_ip
+    eu_west_1 = aws_instance.web_eu_west_1.public_ip
+    ap_south_1 = aws_instance.web_ap_south_1.public_ip
+  }
+}
+```
+
+This works, but it's repetitive — three regions means the same resource block copy-pasted three times. That repetition is exactly what a module is for.
+
+---
+
+**Approach 2 — Wrap it in a module and call it once per region (the reusable, production pattern)**
+
+`modules/ec2-instance/main.tf`:
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source                = "hashicorp/aws"
+      configuration_aliases = [aws]     # tells Terraform this module expects
+    }                                    # an externally-supplied provider
+  }
+}
+
+variable "name" {
+  type = string
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+}
+
+data "aws_ami" "this" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_instance" "this" {
+  ami           = data.aws_ami.this.id
+  instance_type = var.instance_type
+  tags = { Name = var.name }
+}
+
+output "public_ip" { value = aws_instance.this.public_ip }
+```
+
+Root `main.tf`:
+```hcl
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}
+
+provider "aws" {
+  alias  = "eu_west_1"
+  region = "eu-west-1"
+}
+
+provider "aws" {
+  alias  = "ap_south_1"
+  region = "ap-south-1"
+}
+
+module "ec2_us_east_1" {
+  source    = "./modules/ec2-instance"
+  providers = { aws = aws.us_east_1 }
+  name      = "cloudcart-web-us-east-1"
+}
+
+module "ec2_eu_west_1" {
+  source    = "./modules/ec2-instance"
+  providers = { aws = aws.eu_west_1 }
+  name      = "cloudcart-web-eu-west-1"
+}
+
+module "ec2_ap_south_1" {
+  source    = "./modules/ec2-instance"
+  providers = { aws = aws.ap_south_1 }
+  name      = "cloudcart-web-ap-south-1"
+}
+```
+
+The instance definition — AMI lookup, resource block, tags — is now written **once**, inside the module, and each region just calls it with a different `providers` map. This is the pattern I'd actually put in a real repo: adding a fourth region later means adding one provider block and one module call, not duplicating 20+ lines of resource config again.
+
+**Important caveat I always mention:** even with the module pattern, the `providers = { aws = aws.<alias> }` mapping on each module block still has to be **static** — you cannot use `for_each` on the module block to loop through a list of regions and dynamically pick `aws.<region>` from a map of provider aliases. Terraform explicitly forbids referencing provider configurations by anything other than a literal alias at that position. So even the "clean" version still has one visibly repeated block per region — that repetition is a real, known Terraform limitation, not a sign the code needs more DRY-ing.
+
+---
+
+**Approach 3 — When you have more than a handful of regions or need independent blast radius**
+
+If the list of regions is large, or genuinely dynamic (driven by a variable, changing over time), or if a bad `apply` in one region must never be able to affect another region's state — the answer stops being "more provider aliases" and becomes **separate root modules and separate state per region**, typically driven by one of:
+- **Terragrunt**, which generates a full Terraform run per region from a single templated config and a list of regions, avoiding the static-provider-alias limitation entirely at the orchestration layer
+- A **CI/CD matrix strategy** (GitHub Actions `strategy.matrix`, Azure Pipelines matrix) that runs `terraform apply -var="region=eu-west-1"` once per region, each pointed at its own backend state key
+
+This trades simplicity for isolation: each region's `terraform apply` can succeed or fail completely independently, and a mistake in `ap-south-1`'s plan can never touch `us-east-1`'s state file, because they're not in the same state at all.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart needed a lightweight web tier running in three regions — `us-east-1`, `eu-west-1`, `ap-south-1` — for latency reasons, since a meaningful chunk of customers were in Europe and India and a single-region deployment was adding 200+ ms to page loads for them.
+
+Because it was a fixed, small set of three regions that we didn't expect to change often, and all three needed to be deployed together as one coherent release (same AMI version, same app version, rolled out together), we used **Approach 2** — the module + explicit provider alias pattern — inside a single root module with one shared S3 backend state file. Deliberately choosing one shared state here was a real trade-off: it meant one `terraform apply` updated all three regions together (which is what we wanted for consistency), at the cost of a single bad apply theoretically being able to affect all three at once — which we mitigated with `terraform plan` review in the PR and a required approval step before `apply` ran in CI.
+
+Later, when we added a genuinely large, dynamic set of edge cache nodes across 12+ regions for a CDN-adjacent project, we switched to **Approach 3** — Terragrunt generating one Terraform run per region — specifically because at that scale, static provider aliases for 12 regions become unwieldy to read, and we wanted a bad deploy to one edge region to never be able to touch the other 11.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Can I loop a "provider" block with for_each/count over a list of regions?
+  → No. Provider configurations must be statically declared — this is
+    a hard Terraform limitation, not a missing feature I don't know.
+
+How many regions, and is the list fixed or dynamic?
+  → Small, fixed (2–5 regions) → provider aliases in the root module,
+    resource blocks (or better, a module) reference each alias explicitly
+
+  → Large or dynamic list, or needs independent blast radius per region
+    → Separate root module + separate state per region, orchestrated by
+      Terragrunt or a CI/CD matrix strategy
+
+Am I duplicating resource logic across regions?
+  → Wrap the resource in a child module, call it once per region with
+    providers = { aws = aws.<alias> } — still one static block per
+    region, but the resource logic itself is written only once
+
+Did I hardcode one AMI ID for all regions?
+  → No — AMI IDs are region-specific, always resolve via
+    data "aws_ami" scoped to each region's provider
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"The key thing to know is that the AWS provider is region-scoped, and provider blocks can't be looped with `for_each` or `count` — so multi-region always means one statically declared, aliased provider block per region, written by hand. For a small, fixed number of regions, I'd wrap the EC2 instance definition in a child module written once, then call that module once per region, passing in the region's provider alias through the `providers` argument — that avoids duplicating the resource logic even though the provider mapping itself still has to be static. I'd also make sure to resolve the AMI per region with a `data "aws_ami"` block, since AMI IDs aren't the same across regions. If the region list is large or needs to change dynamically, or if I need a bad apply in one region to never affect another, I'd move to separate root modules and separate state per region, usually orchestrated with Terragrunt or a CI matrix, rather than trying to force it into a single Terraform state."*
+
+---
+
 <!-- 
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #2
+## Interview #3
 
 **Company:**  
 **Date:**  
