@@ -15,6 +15,10 @@
   - [Q5. What is Taints and Tolerations? What is the difference between these?](#q5-what-is-taints-and-tolerations-what-is-the-difference-between-these)
   - [Scenario 1. ImagePullBackOff — Possible Reasons?](#scenario-1-imagepullbackoff----possible-reasons)
   - [Scenario 2. Same image works for another app — only my app gets ImagePullBackOff](#scenario-2-advanced-same-image-same-tag-same-registry-works-for-another-app-only-your-application-gets-imagepullbackoff-what-could-be-the-reason)
+- [Interview #2 — Coforge | DevOps Engineer | Technical Round 1](#interview-2)
+  - [Q1. How does endpoint (API server) authentication work in Kubernetes?](#q1-how-does-endpoint-api-server-authentication-work-in-kubernetes)
+  - [Q2. How did you troubleshoot a pod CrashLoopBackOff?](#q2-how-did-you-troubleshoot-a-pod-crashloopbackoff)
+  - [Q3. Explain Kubernetes architecture and components and their uses](#q3-explain-kubernetes-architecture-and-components-and-their-uses)
 
 ---
 
@@ -2432,10 +2436,383 @@ We later automated this with an **OPA Gatekeeper mutation** that automatically i
 
 ---
 
+## Interview #2
+
+**Company:** Coforge
+**Date:** 22-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Senior DevOps Manager
+
+---
+
+### Questions Asked
+
+#### Q1. How does endpoint (API server) authentication work in Kubernetes?
+
+**Answer:**
+
+Every single interaction with a Kubernetes cluster — `kubectl`, a controller, a CI/CD pipeline, another cluster component — is really just an HTTPS request to one endpoint: the **kube-apiserver**. Every request that hits it goes through the same three-stage pipeline, in this exact order: **Authentication** (who are you) → **Authorization** (what are you allowed to do — RBAC) → **Admission Control** (should this specific request be allowed/modified, e.g., OPA/Kyverno policies, resource quotas). This question is specifically about the first stage. I always stress upfront: **authentication only establishes identity — it grants zero permissions by itself.** A perfectly authenticated request with no matching RBAC rule still gets rejected at the authorization stage.
+
+---
+
+**Authentication is pluggable — the API server supports several methods, tried in order**
+
+The API server doesn't have one fixed authentication mechanism — it's configured with one or more authenticator modules, and it tries them until one succeeds (or all fail, returning `401 Unauthorized`). The main ones:
+
+| Method | How it works | Typically used by |
+|---|---|---|
+| **X.509 client certificates** | Mutual TLS — client presents a cert signed by a CA the API server trusts; the cert's CN becomes the username, O fields become groups | Cluster admin bootstrap, control plane components talking to each other, kubelets |
+| **Bearer tokens — ServiceAccount tokens** | A JWT, automatically mounted into every pod, identifying it as `system:serviceaccount:<namespace>:<name>` | Pods, controllers, operators calling the API from inside the cluster |
+| **Bearer tokens — OIDC** | An external identity provider issues a signed JWT (`id_token`); the API server validates it against the provider's issuer and public keys | Human users, in orgs with a corporate IdP wired directly into Kubernetes |
+| **Bearer tokens — Webhook Token Authentication** | The API server doesn't validate the token itself — it forwards it to an external webhook service, which returns the identity | **This is exactly how EKS authenticates IAM identities** — see below |
+| **Static token file / bootstrap tokens** | Legacy flat-file token-to-user mapping, or short-lived tokens used only during node join | Largely legacy; bootstrap tokens still used for `kubeadm join` |
+| **Anonymous requests** | If enabled, unauthenticated requests are treated as `system:anonymous` / group `system:unauthenticated` | Should be tightly restricted (or disabled) via RBAC — a real security setting to check, not just a default to ignore |
+
+---
+
+**The one I'd go deep on, because it directly connects to EKS — Webhook Token Authentication**
+
+This is worth explaining in full, because it's the exact mechanism behind the IAM-to-Kubernetes identity mapping covered in the AWS interview questions (Q1 and Q7 there). EKS doesn't use OIDC `id_token` federation for `kubectl` access the way a lot of people assume — it uses **Webhook Token Authentication**:
+
+1. When you run `kubectl` against an EKS cluster, your kubeconfig is set up (via `aws eks update-kubeconfig`) to run an **exec plugin** — `aws eks get-token` — before every API call.
+2. That plugin generates a short-lived, **pre-signed STS `GetCallerIdentity` request**, encoded as a bearer token — not a real STS response, just a cryptographically signed request that proves "I am this IAM identity" without ever calling STS directly over the network at token-generation time.
+3. `kubectl` sends that token as the `Authorization: Bearer <token>` header on the API request.
+4. The EKS control plane's API server is configured with a **webhook token authenticator** — instead of validating the token itself, it forwards it to AWS's IAM authenticator logic, which actually executes the signed STS request to confirm the IAM identity, then maps that ARN to a Kubernetes username/group using exactly the `aws-auth` ConfigMap or Access Entries mapping from AWS Q1.
+5. That resolved username/group is what flows into the **Authorization** stage — RBAC (AWS Q7) — right after.
+
+So the full chain, end to end, is: **IAM identity → signed STS token → webhook authenticator validates it against AWS → mapped to a k8s username/group → RBAC decides what that identity can do.** Authentication (this question) and authorization (RBAC) are two separate stages of the same pipeline, handled by two completely different mechanisms.
+
+---
+
+**ServiceAccount tokens — how pods and in-cluster processes authenticate**
+
+Any pod that needs to call the Kubernetes API itself — a controller, an operator, a CI job running `kubectl` from inside the cluster — authenticates using its **ServiceAccount token**, automatically mounted at `/var/run/secrets/kubernetes.io/serviceaccount/token`.
+
+```bash
+kubectl exec -it mypod -- cat /var/run/secrets/kubernetes.io/serviceaccount/token
+# a JWT — decodes to something like:
+# { "sub": "system:serviceaccount:production:backend-sa", "aud": ["https://kubernetes.default.svc"], "exp": ... }
+```
+
+**A real, meaningful security improvement worth mentioning proactively:** before Kubernetes v1.24, every ServiceAccount automatically got a **long-lived** token stored as a plain Secret — it never expired on its own, and if it leaked, it worked indefinitely. Since v1.24, Kubernetes uses **Bound Service Account Tokens** by default — short-lived (default 1 hour), audience-scoped JWTs, requested on-demand via the `TokenRequest` API and auto-rotated by the kubelet, rather than a static Secret sitting around forever. This is the exact same shift toward short-lived, auto-rotated credentials that shows up everywhere else in modern AWS/Kubernetes security — the same underlying principle as IRSA, EKS Pod Identity, and IAM Identity Center, just applied to in-cluster pod identity instead of human or AWS-external identity.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart's human `kubectl` access to EKS goes through exactly the webhook token flow described above — engineers authenticate via IAM Identity Center (from the AWS interview questions), which resolves to an IAM role, and `aws eks get-token` is what actually presents that identity to the cluster's API server on every `kubectl` command.
+
+For in-cluster components — we run the **AWS Load Balancer Controller**, **cert-manager**, and a handful of custom operators — each has its own dedicated ServiceAccount, scoped with RBAC to only the resources it actually needs (never a shared "do everything" ServiceAccount across controllers, for the same blast-radius reasons covered in AWS Q7). When we upgraded past Kubernetes v1.24, the shift to Bound Service Account Tokens happened basically transparently — but it directly closed a real gap we'd flagged in an earlier security review: a couple of older ServiceAccounts still had their original long-lived token Secrets sitting around from before the upgrade, effectively permanent credentials nobody was actively tracking the age of. Part of that cleanup was explicitly deleting those legacy Secret-based tokens once we confirmed nothing still depended on them, forcing everything onto the newer, short-lived, auto-rotated mechanism.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Every request to the K8s API server goes through:
+Authentication (who) → Authorization/RBAC (what) → Admission Control
+
+Authentication is pluggable — several methods, tried in order:
+  → X.509 client certs — mTLS, CN = username
+  → ServiceAccount tokens (bearer JWT) — pods/controllers, in-cluster
+  → OIDC — human users via a corporate IdP, if wired directly in
+  → Webhook Token Authentication — API server delegates the identity
+    check to an external service
+    → THIS is how EKS validates IAM identities: signed STS token →
+      webhook → AWS validates it → mapped to k8s username/group via
+      aws-auth/Access Entries (AWS Q1) → flows into RBAC (AWS Q7)
+  → Static/bootstrap tokens — legacy / node-join only
+  → Anonymous — should be locked down via RBAC, not left default
+
+ServiceAccount tokens specifically:
+  → Pre-v1.24: long-lived, static Secret — never expires on its own
+  → v1.24+: Bound Service Account Tokens — short-lived, audience-
+    scoped, auto-rotated via the TokenRequest API — same "no
+    standing credentials" principle as IRSA/EKS Pod Identity
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Every request to the Kubernetes API server goes through the same pipeline — authentication first, to establish identity, then RBAC authorization to decide what that identity can do, then admission control. Authentication itself is pluggable — the API server supports X.509 client certificates, ServiceAccount bearer tokens for pods and controllers, OIDC for human users via a corporate identity provider, and Webhook Token Authentication, where the API server delegates the identity check to an external service. That last one is exactly how EKS authenticates IAM identities — kubectl generates a signed STS token, sends it as a bearer token, and a webhook validates it against AWS and maps the IAM identity to a Kubernetes username or group, which then flows into RBAC. For in-cluster components, authentication happens via the pod's ServiceAccount token — and it's worth knowing that since Kubernetes 1.24, those are short-lived, audience-bound tokens auto-rotated through the TokenRequest API by default, replacing the old long-lived static Secret-based tokens, which is the same shift toward short-lived, non-static credentials you see with IRSA and EKS Pod Identity on the AWS side."*
+
+---
+
+#### Q2. How did you troubleshoot a pod CrashLoopBackOff?
+
+**Answer:**
+
+Since this is asking specifically about my own experience rather than the general concept — I've covered what CrashLoopBackOff *is* and the common causes elsewhere (Interview #1, Q2) — I'll walk through one specific, memorable incident, since that shows the actual investigation process rather than reciting a list of causes.
+
+---
+
+**Situation**
+
+At CloudCart, we shipped a new feature to the `analytics-service` that loaded a fairly large reference dataset into memory at startup, before the app could start responding to requests. Right after that deploy, the pod went into `CrashLoopBackOff`, restarting roughly every 30–40 seconds.
+
+---
+
+**The investigation, step by step**
+
+**Step 1 — Confirm the symptom and restart pattern:**
+```bash
+kubectl get pods -n analytics
+```
+```
+NAME                          READY   STATUS             RESTARTS   AGE
+analytics-service-7d9f8b-x2p9  0/1    CrashLoopBackOff   14         12m
+```
+14 restarts in 12 minutes — consistent, rapid restarts, not a one-off.
+
+**Step 2 — The key branching question: is the app crashing itself, or is Kubernetes killing it?** This is the first thing I check, because the two lead to completely different investigations.
+```bash
+kubectl describe pod analytics-service-7d9f8b-x2p9 -n analytics
+```
+```
+Events:
+  Warning  Unhealthy  Liveness probe failed: HTTP probe failed with statuscode: 000
+  Normal   Killing    Container analytics-service failed liveness probe, will be restarted
+```
+This was the answer, right there in the Events section: there was **no `OOMKilled` reason**, no application-level crash — the container was being actively **killed by Kubernetes** because its liveness probe was failing. That immediately redirected the investigation away from "what's wrong with the app" and toward "why is the probe failing."
+
+**Step 3 — Check what the app was actually doing at the moment it got killed:**
+```bash
+kubectl logs analytics-service-7d9f8b-x2p9 -n analytics --previous
+```
+```
+[INFO] Starting analytics-service...
+[INFO] Loading reference dataset... 60% complete
+```
+`--previous` shows logs from the **last terminated container**, not the current (already-restarted) one — essential here, since the current container was mid-startup again by the time I looked. This log showed the app wasn't broken at all — it was still in the middle of a legitimate startup task, 60% through loading a dataset, when it got killed.
+
+**Step 4 — Check the actual probe configuration against real startup time:**
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  failureThreshold: 3
+```
+Doing the math: the probe starts checking at 10 seconds, checks every 10 seconds, and gives up after 3 consecutive failures — so Kubernetes would kill the container at roughly the **40-second mark** if `/health` never responded. The new dataset-loading step, once measured properly, took close to **90 seconds** on a cold start. The probe's timing simply hadn't been updated when the new feature was added — the app was being killed for taking longer to start than a probe config that predated the change.
+
+---
+
+**Root cause**
+
+This was a **self-inflicted crash loop** — not an application bug, not OOM, not a config/dependency issue. The liveness probe was configured for the app's *old* startup time, and nobody updated it when a new feature made startup meaningfully slower. Kubernetes was doing exactly what it was told: kill anything that doesn't respond healthy within the configured window — the window itself was just wrong.
+
+---
+
+**The fix**
+
+The quick fix would have been to just increase `initialDelaySeconds`, but I didn't want to do that alone — padding the liveness probe's initial delay also delays how quickly Kubernetes detects a **genuinely** hung container later, during normal steady-state running, since `initialDelaySeconds` and the ongoing check interval are the same probe. The better fix is a dedicated **`startupProbe`**, built exactly for this — it runs first, and liveness/readiness checks don't even start until it succeeds, so a slow-but-healthy startup doesn't have to compromise how tightly liveness is tuned afterward:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 12          # 12 × 10s = 120s budget for startup — comfortably covers the ~90s load time
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 3           # stays tight for genuine steady-state hangs, unaffected by startup time
+```
+
+Once the `startupProbe` is passing, the `livenessProbe` takes over — so a real hang once the app is already running still gets caught quickly, while a legitimately slow startup no longer gets mistaken for one.
+
+---
+
+**What we changed afterward**
+
+Beyond the immediate fix, we added two things: a PR review checklist item specifically for any change that affects startup time (a new migration step, a new data load, a heavier dependency init) to explicitly re-check probe timing, since this is exactly the kind of change that's easy to ship without anyone connecting it to probe configuration at all; and a Grafana panel showing container restart counts overlaid with deployment markers, so a pattern like this — restarts spiking right after a specific deploy — is visible at a glance instead of needing someone to notice `CrashLoopBackOff` and start digging manually.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+CrashLoopBackOff — first, the branching question:
+
+Is Kubernetes killing the container, or is the app crashing itself?
+  → kubectl describe pod, check Events:
+    "Liveness probe failed" / "Killing container" → Kubernetes is
+      killing it — investigate probe config vs. actual startup/
+      response time
+    "OOMKilled" → resource limits vs. actual memory usage
+    Neither, but restarting → app-level crash — kubectl logs
+      --previous for the actual stack trace / exit code
+
+For a probe-caused crash loop specifically:
+  → Compare probe timing (initialDelaySeconds + periodSeconds ×
+    failureThreshold) against REAL startup time, not assumed time
+  → Fix with a dedicated startupProbe rather than just padding
+    initialDelaySeconds on the liveness probe — keeps steady-state
+    hang detection tight while giving startup its own budget
+
+Afterward: what would catch this pattern faster next time?
+  → PR review checklist for startup-time-affecting changes
+  → Restart-count dashboards correlated with deploy events
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"The first thing I check with any CrashLoopBackOff is `kubectl describe pod` and specifically the Events section, to answer one branching question: is Kubernetes killing this container, or is the app crashing on its own? In this case, the Events showed 'Liveness probe failed' and 'Killing container' — no OOMKilled, no app-level crash — so I knew immediately it was a probe problem, not an application bug. `kubectl logs --previous` confirmed the app was still legitimately mid-startup, loading a dataset, when it got killed — the liveness probe's timing just hadn't been updated when a new feature made startup slower, so Kubernetes was killing a perfectly healthy, still-starting container. Rather than just increasing the liveness probe's initial delay, which would have also slowed down detecting a genuinely hung container later, I added a dedicated startupProbe with enough budget to cover real startup time, and left the liveness probe tight for actual steady-state hangs. We also added a PR checklist item for any change that affects startup time, and a dashboard correlating restart counts with deploys, specifically so this exact pattern gets caught faster next time instead of needing someone to manually notice and dig into it."*
+
+---
+
+#### Q3. Explain Kubernetes architecture and components and their uses
+
+**Answer:**
+
+Kubernetes architecture splits cleanly into two groups: the **Control Plane** (the "brain" — makes decisions, doesn't run application workloads) and **Worker Nodes** (where application containers actually run). I always explain it by first listing the components, then walking through what actually happens when a Pod gets created — because that's what shows real understanding of how the pieces work together, not just what each one is called.
+
+---
+
+**The architecture, at a glance**
+
+```
+┌──────────────────────── CONTROL PLANE ────────────────────────┐
+│                                                                    │
+│   kube-apiserver  ←── the only component that talks to etcd       │
+│         │                                                          │
+│         ├── etcd                    (cluster's source of truth)    │
+│         ├── kube-scheduler           (decides WHICH node a pod runs on) │
+│         ├── kube-controller-manager  (reconciliation loops)         │
+│         └── cloud-controller-manager (cloud provider integration)   │
+└──────────────────────────────┬──────────────────────────────────┘
+                                  │  (all communication goes through
+                                  │   the API server, in every direction)
+┌──────────────────────────────┴──────────────────────────────────┐
+│                          WORKER NODE(S)                             │
+│                                                                       │
+│   kubelet          — talks to the API server, runs/monitors pods     │
+│   kube-proxy        — implements Service networking on this node      │
+│   Container runtime  — containerd/CRI-O — actually runs containers      │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+**Control Plane components**
+
+| Component | What it actually does |
+|---|---|
+| **kube-apiserver** | The front door — every request (`kubectl`, controllers, kubelets, external tools) goes through it. Runs the request pipeline: authentication → RBAC authorization → admission control (Interview #2, Q1). It's the **only** component that talks to `etcd` directly |
+| **etcd** | A distributed, consistent key-value store — the cluster's actual database. Every object's desired and current state lives here. If `etcd` is lost with no backup, the cluster's state is gone — this is the component disaster recovery planning centers on |
+| **kube-scheduler** | Watches for Pods that exist but have no node assigned yet, and decides which node each should run on — based on resource requests, taints/tolerations (Interview #1, Q5), affinity/anti-affinity rules |
+| **kube-controller-manager** | Runs multiple **reconciliation loops** ("controllers") bundled into one process — each one continuously watches the cluster's actual state and works to match it to the desired state. Example: the ReplicaSet controller notices "3 replicas wanted, 2 running" and creates a new Pod |
+| **cloud-controller-manager** | Integrates Kubernetes with the underlying cloud provider — e.g., provisioning a cloud load balancer when a `Service` of type `LoadBalancer` is created, or updating node status when the cloud provider terminates an instance |
+
+---
+
+**Worker Node components**
+
+| Component | What it actually does |
+|---|---|
+| **kubelet** | The node's primary agent — watches the API server for Pods assigned to its node, tells the container runtime to start/stop containers accordingly, executes liveness/readiness/startup probes (Interview #2, Q2), and reports pod/node status back |
+| **kube-proxy** | Maintains the networking rules (via `iptables` or `IPVS`) on each node that implement the `Service` abstraction — routing traffic sent to a Service's virtual IP to one of the actual backend Pod IPs |
+| **Container runtime** | The software that actually creates and runs containers — `containerd` or `CRI-O`, communicating with `kubelet` through the **Container Runtime Interface (CRI)**. Not Docker Engine on any current cluster (Docker Interview #2, Q1) |
+
+**Worth mentioning as important supporting pieces, even though they're technically add-ons, not "core" components:** **CoreDNS** for in-cluster service discovery (resolving a Service name to its ClusterIP), a **CNI plugin** (like the AWS VPC CNI on EKS, or Calico/Cilium elsewhere) for actual Pod networking, and an **Ingress Controller** (like the AWS Load Balancer Controller — AWS Q5) for turning `Ingress` objects into real load balancer configuration.
+
+---
+
+**How it all fits together — tracing an actual Pod creation**
+
+This is the part I always walk through, because a component list alone doesn't show whether you understand how they interact:
+
+```
+1. `kubectl apply -f pod.yaml`
+   → Request hits kube-apiserver: authenticated, authorized (RBAC),
+     passed through admission controllers, then persisted to etcd.
+     At this point the Pod exists as an object, but has no node yet.
+
+2. kube-scheduler is watching the API server for exactly this —
+   Pods with no assigned node. It evaluates resource requests,
+   taints/tolerations, affinity rules, picks a node, and writes
+   that decision back to the API server (which persists it to etcd).
+
+3. kubelet, on the chosen node, is also watching the API server.
+   It sees a Pod has just been assigned to ITS node, and tells the
+   container runtime (via CRI) to pull the image and start the
+   container(s).
+
+4. If this Pod is part of a Service, kube-proxy updates that node's
+   networking rules so traffic to the Service's virtual IP can reach
+   this new Pod as one of its backends.
+
+5. kubelet continuously runs the Pod's health probes and reports
+   status back to the API server → etcd, the whole time.
+
+6. If the Pod later dies unexpectedly, kube-controller-manager's
+   ReplicaSet controller notices actual replica count has dropped
+   below desired, and the whole cycle repeats from step 1 —
+   automatically, with no human involved.
+```
+
+Every step routes through `kube-apiserver` — no two components talk to each other directly. That's a deliberate design choice: the API server is the single, consistent point of coordination, and every other component works by **watching** it for changes relevant to its own job, not by being told directly by another component.
+
+---
+
+**Real-world example — CloudCart (EKS specifically)**
+
+Running on **EKS** changes what CloudCart's team actually operates versus what's outsourced. AWS fully manages the **entire control plane** — `kube-apiserver`, `etcd`, `kube-scheduler`, `kube-controller-manager` — including its high availability, patching, scaling, and `etcd` backups. We never SSH into or directly interact with any control-plane component; from our side, it's just the API endpoint `kubectl` talks to. Our actual responsibility is the **worker node** side — running `kubelet` and `kube-proxy` on our EC2-backed node groups (or none at all, if using Fargate), and the cluster uses the **AWS VPC CNI** plugin for Pod networking by default, which is exactly why pod IP consumption directly affects subnet sizing (AWS Q1, Interview #2).
+
+A concrete scheduler-related incident: we once added a taint to a set of nodes to reserve them for a new GPU-based workload, and a routine deployment for an unrelated service suddenly had pods stuck in `Pending`. `kubectl describe pod` showed `0/8 nodes are available: 3 node(s) had taint {workload: gpu}, that the pod didn't tolerate` — the scheduler was doing exactly its job, correctly refusing to place a pod on nodes it wasn't tolerant of, but the deployment's replica count needed more capacity than the remaining untainted nodes had. That's a scheduler-and-taints interaction (Interview #1, Q5) directly, not a bug — the fix was adding more untainted capacity via cluster autoscaling, not touching the taint itself.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Two groups: Control Plane (decides) vs Worker Nodes (runs workloads)
+
+Control Plane:
+  kube-apiserver           → the front door, only thing touching etcd
+  etcd                      → the cluster's actual database
+  kube-scheduler             → decides WHICH node a pod runs on
+  kube-controller-manager     → reconciliation loops, desired vs actual state
+  cloud-controller-manager     → cloud provider integration (LBs, nodes)
+
+Worker Node:
+  kubelet     → runs/monitors pods on this node, talks to the API server
+  kube-proxy   → implements Service networking on this node
+  container runtime → actually runs containers (containerd/CRI-O, not Docker)
+
+Best way to prove understanding, not just recite the list:
+  → Walk through an actual Pod creation, step by step, showing
+    everything routes through kube-apiserver and every other
+    component works by WATCHING it, not direct component-to-
+    component calls
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Kubernetes splits into the control plane, which makes decisions, and worker nodes, which run the actual workloads. On the control plane: kube-apiserver is the front door everything goes through, and the only component that talks to etcd, which is the cluster's actual database; kube-scheduler decides which node a new pod runs on; kube-controller-manager runs reconciliation loops that keep actual state matching desired state, like recreating a pod that died; and cloud-controller-manager integrates with the cloud provider for things like provisioning load balancers. On worker nodes: kubelet runs and monitors the pods assigned to that node and talks to the container runtime — containerd or CRI-O, not Docker on any current cluster — and kube-proxy implements the networking rules that make Services work. The best way I've found to actually demonstrate understanding of this is walking through what happens when you run `kubectl apply` — the request goes to the API server, gets persisted to etcd, the scheduler picks a node, kubelet on that node starts the container, and every one of those steps happens through components watching the API server, not talking to each other directly. On EKS specifically, AWS manages the entire control plane for us — we only operate the worker node side."*
+
+---
+
+<!-- Add more scenario questions as Scenario 1, Scenario 2... -->
+
+---
+
 <!--
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #2
+## Interview #3
 
 **Company:**
 **Date:**

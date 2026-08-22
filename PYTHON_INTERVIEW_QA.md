@@ -12,6 +12,8 @@
   - [Q1. A folder has 10 files, 3 of them have IP addresses as filenames — how do you read only those files? (+ Follow-up: how do you specify the folder location in Python?)](#q1-a-folder-has-10-files-3-of-them-have-ip-addresses-as-filenames--how-do-you-read-only-those-files--follow-up-how-do-you-specify-the-folder-location-in-python)
   - [Q2. Can you write a Lambda function to read a file from S3? (+ Follow-up: reading S3 objects with boto3)](#q2-can-you-write-a-lambda-function-to-read-a-file-from-s3--follow-up-reading-s3-objects-with-boto3)
   - [Q3. A Python application isn't working properly — what Linux commands would you use to debug it? (+ Follow-up: what does the top command do?)](#q3-a-python-application-isnt-working-properly--what-linux-commands-would-you-use-to-debug-it)
+  - [Q4. Write a script to monitor a directory and print the names of new files added every minute (+ Follow-up: difference between set and list?)](#q4-write-a-script-to-monitor-a-directory-and-print-the-names-of-new-files-added-every-minute)
+  - [Q5. Write a function that takes a list of job log dictionaries and returns the job IDs where status is "FAILED"](#q5-write-a-function-that-takes-a-list-of-job-log-dictionaries-and-returns-the-job-ids-where-status-is-failed)
 
 ---
 
@@ -729,6 +731,315 @@ top -b -n 1 -p 4821          # batch mode, watching one specific PID
 **`top` vs. `htop`:** `htop` is the friendlier, color-coded, scrollable, mouse-clickable version of the same idea — genuinely nicer to use — but it's a separate package that has to be installed, and it isn't guaranteed to be present on a minimal server or container image. `top` ships with essentially every Linux system by default, no installation required, which is exactly why it's the one I reach for first when I'm on an unfamiliar box and don't know what's already installed.
 
 **Tying back to the earlier debugging workflow:** if I suspected a memory leak in the CloudCart backend, `top`, sorted by memory (`M`) and left running for a few minutes, watching one PID's `RES` column climb steadily upward with no plateau, is exactly how I'd confirm it's a real leak rather than normal memory usage — before going further and using `py-spy` to find *where* in the code the leak is actually coming from.
+
+---
+
+#### Q4. Write a script to monitor a directory and print the names of new files added every minute
+
+**Answer:**
+
+This is a **polling** problem: check the directory's contents, wait, check again, and figure out what's different between the two checks. The core trick is using a Python **`set`**, because sets make "what's new" a single, fast operation — subtracting one set from another gives you exactly the items that are in the second but not the first.
+
+---
+
+**The script**
+
+```python
+import pathlib
+import sys
+import time
+
+
+def get_current_files(folder_path: pathlib.Path) -> set[str]:
+    return {f.name for f in folder_path.iterdir() if f.is_file()}
+
+
+def monitor_directory(folder_path: pathlib.Path, interval_seconds: int = 60) -> None:
+    previous_files = get_current_files(folder_path)
+    print(f"Monitoring {folder_path} — {len(previous_files)} file(s) found at start.")
+
+    while True:
+        time.sleep(interval_seconds)
+        current_files = get_current_files(folder_path)
+        new_files = current_files - previous_files
+
+        if new_files:
+            for filename in sorted(new_files):
+                print(f"New file detected: {filename}")
+        else:
+            print("No new files this minute.")
+
+        previous_files = current_files
+
+
+if __name__ == "__main__":
+    folder = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(".")
+    monitor_directory(folder)
+```
+
+```bash
+python3 monitor_folder.py /var/uploads
+```
+
+---
+
+**Breaking down every new concept here, since this pulls in a few things Q1–Q3 didn't need:**
+
+- **`set[str]`** — a Python `set` is an unordered collection with **no duplicates**. I'm using one specifically because sets support fast subtraction: `current_files - previous_files` returns every filename that's in `current_files` but **not** in `previous_files` — which is exactly the definition of "a file that's new since last time." Doing the equivalent with plain lists would mean manually looping and comparing, which is slower and more code for the same result.
+- **`{f.name for f in folder_path.iterdir() if f.is_file()}`** — this is a **set comprehension**: like a `for` loop that builds a collection in one line. It's the same idea as a list comprehension (`[... for ... in ...]`), just with curly braces instead of square brackets, which tells Python to build a `set` instead of a `list`. `if f.is_file()` filters out subdirectories, so only actual files count.
+- **`while True:`** — an infinite loop. It runs forever, checking the directory over and over, until the script is manually stopped (Ctrl+C) or killed. This is the right structure for a long-running monitoring script — it's meant to keep running indefinitely, not finish and exit.
+- **`time.sleep(interval_seconds)`** — pauses execution for that many seconds without using CPU while it waits. Placing it at the top of the loop, before the check, means the script waits a full minute before its *first* comparison — which is correct here, since the very first snapshot (`previous_files`, taken before the loop starts) already captured whatever existed at startup; there's nothing "new" to report until a minute has actually passed.
+- **`sys.argv`** — the list of command-line arguments passed to the script. `sys.argv[0]` is always the script's own filename; `sys.argv[1]` is the first real argument, if the user provided one. The line `pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(".")` means: use the folder the user specified, or default to the current directory if they didn't pass one.
+
+---
+
+**A real gotcha worth mentioning — "new" doesn't always mean "ready"**
+
+If a file appears in the directory because something is actively **writing** to it — a large export, an upload still in progress via SFTP or `rsync` — this script will report it as "new" the moment it appears, even though its contents aren't finished yet. For a lot of real automation (like triggering a processing pipeline the moment a new file shows up), reading a half-written file is a genuine bug waiting to happen. A more robust version checks that the file's **size has stopped changing** across two consecutive checks before treating it as truly ready:
+
+```python
+def is_file_stable(file_path: pathlib.Path, wait_seconds: float = 2.0) -> bool:
+    size_before = file_path.stat().st_size
+    time.sleep(wait_seconds)
+    size_after = file_path.stat().st_size
+    return size_before == size_after
+```
+
+I'd only mention this if the interviewer's follow-up pushes toward "what could go wrong with this" — it's not part of the literal ask, but it's the kind of detail that shows real production experience rather than a textbook answer.
+
+---
+
+**Follow-up worth raising proactively — polling vs. event-driven monitoring**
+
+The script above **polls**: it actively checks the directory on a fixed schedule, even if nothing changed. That's fine for a once-a-minute check, but it has two real limits: detection is delayed by up to the full interval (a file added right after a check waits almost a full minute to be reported), and it gets slower as the directory grows, since `iterdir()` has to list *everything* on every single check.
+
+The alternative is **event-driven monitoring**, using the third-party **`watchdog`** library, which taps into the operating system's own filesystem notification mechanism (`inotify` on Linux, `FSEvents` on macOS) instead of repeatedly listing the directory:
+
+```python
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import time
+
+class NewFileHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if not event.is_directory:
+            print(f"New file detected: {event.src_path}")
+
+if __name__ == "__main__":
+    handler = NewFileHandler()
+    observer = Observer()
+    observer.schedule(handler, path=".", recursive=False)
+    observer.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+```
+
+This detects a new file **almost instantly**, rather than waiting for the next poll, and doesn't get slower as the directory grows, since the OS itself pushes an event rather than the script re-scanning everything. I'd bring this up specifically because the question said "every minute" — which is exactly the kind of fixed-interval requirement that suggests polling is genuinely what's being asked for — but knowing the event-driven alternative exists, and why you'd reach for it instead, is exactly the kind of thing that separates "I can write the requested script" from "I understand the trade-off I'm making by writing it this way."
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart has a folder where partner vendors drop daily inventory CSV files via SFTP, which triggers a processing pipeline. The first version of that watcher script was almost identical to the one above — poll, diff the file list, report anything new. It worked in testing, then broke in production: one vendor's upload was large enough that the SFTP transfer took a few seconds, and the watcher's poll happened to land in the middle of that transfer, picking up the file the moment it appeared and handing a **partial, truncated CSV** to the processing pipeline — which failed with a confusing parsing error that had nothing obviously to do with "the file wasn't finished uploading yet."
+
+The fix was exactly the stability check described above — before treating a detected file as ready to process, the script waits a couple of seconds and re-checks its size, only proceeding once the size has stopped changing. It's a small addition, but it's the difference between a script that works in a quick test and one that's actually safe to run against real, unpredictable upload timing in production.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+"New files" = set difference between two snapshots in time
+
+1. Take a snapshot of filenames now (a set, for fast comparison)
+2. Sleep for the interval (60s here)
+3. Take a new snapshot
+4. new_files = current_snapshot - previous_snapshot
+5. Report them, then the current snapshot becomes the new baseline
+6. Repeat forever (while True) — this is a long-running process,
+   not a one-shot script
+
+Proactively worth mentioning:
+  → "New" doesn't mean "finished being written" — a stability
+    check (size unchanged across two checks) avoids reading a
+    half-written file
+  → Polling has a real alternative — event-driven monitoring via
+    the `watchdog` library — worth knowing the trade-off even
+    though a fixed "every minute" requirement points at polling
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"I'd take a snapshot of the directory's filenames as a Python set, sleep for 60 seconds, take another snapshot, and use set subtraction — current minus previous — to get exactly the files that are new since the last check, printing those and then updating the baseline for the next loop. I'd wrap that in a `while True` loop since this needs to run indefinitely, not just once. One thing I'd flag proactively: a file showing up as 'new' doesn't mean it's finished being written — if something's still uploading to that folder, I'd add a quick check that the file's size has stopped changing across two checks before treating it as ready, since I've actually seen a script pick up a partially-written file and fail downstream because of it. I'd also mention that this is a polling approach — since the requirement is a fixed one-minute interval, that's the right tool here, but for something needing near-instant detection instead, I'd reach for the `watchdog` library instead, which uses the OS's own filesystem event notifications rather than repeatedly re-scanning the directory."*
+
+---
+
+**Follow-up — What is the difference between `set` and `list` in Python?**
+
+This is a natural follow-up to the script above, since it specifically used a `set` rather than a `list` — and the reason why is really the core of the answer.
+
+**Side-by-side**
+
+| Aspect | `list` | `set` |
+|---|---|---|
+| **Order** | Preserved — stays in the order you added items | Not guaranteed — treat it as unordered |
+| **Duplicates** | Allowed | Automatically removed — adding an existing value does nothing |
+| **Indexing** | Yes — `my_list[0]` works | **No** — a set isn't subscriptable, `my_set[0]` raises `TypeError` |
+| **Membership test (`x in ...`)** | **O(n)** — checks every element one at a time until it finds a match | **O(1)** on average — a hash lookup, effectively instant regardless of size |
+| **What it can hold** | Anything, including other lists/dicts | Only **hashable** (effectively, immutable) items — no lists or dicts as elements |
+| **Built-in set operations** | None — you'd write a loop | Union `\|`, intersection `&`, difference `-`, symmetric difference `^` — built in |
+| **Syntax** | `[1, 2, 3]`, empty is `[]` | `{1, 2, 3}`, empty is `set()` — **`{}` alone creates an empty `dict`, not a set!** |
+
+**A quick demonstration of the actual behavior:**
+
+```python
+my_list = [1, 2, 2, 3]
+my_set = {1, 2, 2, 3}
+
+print(my_list)   # [1, 2, 2, 3]  — duplicate 2 kept
+print(my_set)    # {1, 2, 3}     — duplicate 2 silently dropped
+
+my_list[0]        # 1 — works fine, lists are indexed
+my_set[0]         # TypeError: 'set' object is not subscriptable
+
+{1, 2, 3} - {2, 3}   # {1}         — set difference
+{1, 2, 3} | {3, 4}   # {1, 2, 3, 4} — union
+{1, 2, 3} & {2, 3, 4} # {2, 3}      — intersection
+```
+
+**Why the script above specifically needed a `set`, not a `list`**
+
+Computing "what's new" is fundamentally a **repeated membership comparison** between two collections — for every filename in the current snapshot, you're effectively asking "was this already in the previous snapshot?" With a `set`, the built-in `-` operator does that whole comparison in one step, and because set membership checks are O(1) (a hash lookup) rather than O(n) (scanning the whole list), the comparison stays fast even if the directory has thousands of files. Doing the same thing with two `list`s would mean checking each filename against every filename in the other list — proportional to the size of *both* lists multiplied together — which gets noticeably slower as the directory grows, for no reason other than choosing the wrong data structure.
+
+**Real-world example — CloudCart**
+
+We once had a script that checked incoming order IDs against a list of already-processed order IDs to avoid double-processing a webhook that fired twice — written with a plain Python `list`, since early on there were only a few hundred processed IDs and the `in` check was instant either way. As that list grew into the tens of thousands over a few months of production traffic, the check `if order_id in processed_ids` became measurably slower — visible in the service's own latency metrics, since every single incoming webhook was now scanning a list with tens of thousands of entries one item at a time. Switching `processed_ids` from a `list` to a `set` made the check effectively instant again, completely independent of how many IDs had accumulated — a one-line change (`processed_ids = set(...)` instead of `processed_ids = [...]`) that fixed a real, gradually-worsening performance problem.
+
+**When I'd actually reach for each:**
+- **`list`** — when order matters, duplicates are meaningful, or I need to access items by position
+- **`set`** — when I only care about uniqueness, I'm doing frequent membership checks, or I need fast mathematical set operations like union/intersection/difference
+
+---
+
+#### Q5. Write a function that takes a list of job log dictionaries and returns the job IDs where status is "FAILED"
+
+**Answer:**
+
+**Corrected example data first** — the pasted example had a few transcription issues (parentheses `(...)` where it should be curly braces `{...}`, `job_jd` instead of `job_id`, `imestamp` instead of `timestamp`, a stray `*`, and a missing comma before the last entry). Here's what it should actually look like as valid Python:
+
+```python
+logs = [
+    {"job_id": 101, "status": "SUCCESS", "timestamp": "2025-06-10T10:00:00"},
+    {"job_id": 102, "status": "FAILED",  "timestamp": "2025-06-10T10:05:00"},
+    {"job_id": 103, "status": "FAILED",  "timestamp": "2025-06-10T10:10:00"},
+    {"job_id": 104, "status": "SUCCESS", "timestamp": "2026-06-10T10:15:00"},
+]
+```
+
+This is a filtering problem: loop through the logs, keep only the ones where `status` is `"FAILED"`, and pull out their `job_id`.
+
+---
+
+**The straightforward solution**
+
+```python
+def get_failed_job_ids(logs: list[dict]) -> list[int]:
+    return [log["job_id"] for log in logs if log["status"] == "FAILED"]
+```
+
+```python
+print(get_failed_job_ids(logs))
+# [102, 103]
+```
+
+**Breaking this down:** this is a **list comprehension with a filter condition** — the general shape is `[expression for item in iterable if condition]`. Read left to right: "for each `log` in `logs`, if `log["status"] == "FAILED"`, include `log["job_id"]` in the result." `log["job_id"]` and `log["status"]` are plain dictionary key lookups — square brackets, the key name as a string.
+
+For anyone who finds the comprehension harder to read at a glance, this is functionally identical, written as an explicit loop:
+
+```python
+def get_failed_job_ids(logs: list[dict]) -> list[int]:
+    failed_ids = []
+    for log in logs:
+        if log["status"] == "FAILED":
+            failed_ids.append(log["job_id"])
+    return failed_ids
+```
+
+---
+
+**The gotcha I'd raise proactively — and it's directly relevant given how the example data arrived**
+
+Using `log["status"]` and `log["job_id"]` with square brackets **crashes the entire function** with a `KeyError` the moment it hits even one dictionary that's missing that key — for example, a malformed log entry (exactly the kind of typo the pasted example itself had, like `job_jd` instead of `job_id`). One bad record shouldn't be able to take down the processing of the other 99 good ones.
+
+The fix is using **`.get()`** instead of direct key access — `.get("key")` returns `None` if the key doesn't exist, instead of raising an exception:
+
+```python
+def get_failed_job_ids(logs: list[dict]) -> list[int]:
+    failed_ids = []
+    for log in logs:
+        if log.get("status") == "FAILED":
+            job_id = log.get("job_id")
+            if job_id is not None:
+                failed_ids.append(job_id)
+    return failed_ids
+```
+
+A record missing `"status"` entirely just silently doesn't match `"FAILED"` (since `None != "FAILED"`) and gets skipped, rather than crashing the whole batch. I'd mention this as the more production-appropriate version, especially for something like log processing, where malformed records are a realistic, expected occurrence rather than a hypothetical edge case.
+
+---
+
+**A clarifying question worth asking the interviewer, not assuming**
+
+The spec doesn't say what should happen if the **same `job_id` appears more than once** with `"FAILED"` status — for example, a job that was retried and failed twice, logged as two separate entries. Should the result contain that ID twice (one per failed log entry), or once (unique failed job IDs)? I'd ask rather than guess. If uniqueness is wanted, this connects directly to the set-vs-list discussion from the previous question — I'd track "already seen" IDs in a `set` for fast O(1) lookups, while still returning an order-preserving `list`:
+
+```python
+def get_failed_job_ids_unique(logs: list[dict]) -> list[int]:
+    seen = set()
+    failed_ids = []
+    for log in logs:
+        if log.get("status") == "FAILED":
+            job_id = log.get("job_id")
+            if job_id is not None and job_id not in seen:
+                seen.add(job_id)
+                failed_ids.append(job_id)
+    return failed_ids
+```
+
+---
+
+**Real-world example — CloudCart**
+
+We have a nightly script that pulls batch job results (a list of dicts, structurally identical to this example) from a job-runner's status API and posts a Slack alert listing any failed job IDs. The very first version used direct key access (`log["status"]`), and it broke in production the first time a legacy job runner — a slightly older version still running for one team that hadn't upgraded yet — emitted a log entry with a differently-named field instead of `"status"`. One malformed record from that one legacy runner caused a `KeyError` that killed the entire nightly report for **every** team, not just the one with the odd log format — nobody got their failure alerts that night because of a single bad record buried among hundreds of good ones. Switching to `.get()` fixed it immediately: a genuinely malformed record just gets skipped (and now also logged separately as "couldn't parse this entry" for visibility), while every well-formed record is still processed and reported correctly.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+1. Basic filter → list comprehension with a condition:
+   [log["job_id"] for log in logs if log["status"] == "FAILED"]
+
+2. Is malformed/incomplete input realistic here (log data usually is)?
+   → Yes → use .get() instead of direct [] access, so one bad
+     record doesn't crash the whole batch with a KeyError
+
+3. Could the same job_id appear more than once?
+   → Ask, don't assume — if uniqueness is wanted, track "seen"
+     IDs in a set (O(1) lookup) while building an order-preserving
+     list of results
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"The core of it is a list comprehension with a filter: for each log entry, if status equals FAILED, include its job_id in the result. The detail I'd add without being asked is using `.get()` instead of direct dictionary key access, since real log data realistically includes malformed entries, and I don't want one bad record — missing the status or job_id key — to raise a KeyError and crash the processing of every other valid record in the batch. I'd also ask whether the same job_id could legitimately appear more than once, for something like a retried job that failed twice — if duplicates should be collapsed, I'd track already-seen IDs in a set for fast lookups while still building the result as an order-preserving list."*
 
 ---
 

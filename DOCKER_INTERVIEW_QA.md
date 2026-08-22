@@ -15,6 +15,8 @@
   - [Q5. What is Multi-stage Build? Have you implemented it? Why do we use it?](#q5-what-is-multi-stage-build-have-you-implemented-multi-stage-build-in-your-project-why-do-we-use-multi-stage-build)
   - [Scenario 1. Application Container cannot connect to Database Container](#scenario-1-application-container-cannot-connect-to-database-container-both-containers-are-running-on-the-same-host-getting-connection-refused-how-will-you-troubleshoot)
   - [Scenario 2. Containers running, network fine, config correct — still Connection Refused](#scenario-2-interviewer-removed-all-obvious-causes----containers-running-network-fine-configuration-correct----still-getting-connection-refused-what-will-you-check-now)
+- [Interview #2 — Coforge | DevOps Engineer | Technical Round 1](#interview-2)
+  - [Q1. What's the difference between Docker and Kubernetes?](#q1-whats-the-difference-between-docker-and-kubernetes)
 
 ---
 
@@ -2208,10 +2210,118 @@ Long-term fix: added `idleTimeoutMillis` and `connectionTimeoutMillis` to the co
 
 ---
 
+## Interview #2
+
+**Company:** Coforge
+**Date:** 22-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Senior DevOps Manager
+
+---
+
+### Questions Asked
+
+#### Q1. What's the difference between Docker and Kubernetes?
+
+**Answer:**
+
+The most important thing to say first — and the thing that shows real understanding rather than a memorized comparison — is that **Docker and Kubernetes aren't really alternatives to each other; they solve completely different problems, at different layers, and in practice they work together, not instead of each other.** Docker is about **packaging and running a container**; Kubernetes is about **orchestrating many containers across many machines**. Let me break down what each actually does.
+
+---
+
+**Docker — packaging and running containers, on one machine**
+
+Docker is a **containerization platform**. Its job is:
+- **Build** a container image from a `Dockerfile` — bundling an application with its dependencies into a single, portable, standardized unit
+- **Run** that image as a container on a single host, using its daemon (`dockerd`) and CLI
+- Provide basic single-host tooling — `docker-compose` for running a handful of related containers together on one machine
+
+Docker answers the question: *"How do I package my application so it runs identically on my laptop, in CI, and in production?"*
+
+**Kubernetes — orchestrating containers across a cluster**
+
+Kubernetes is a **container orchestration platform**. Its job starts where Docker's ends — given potentially hundreds of containers that need to run across a fleet of many machines (nodes), Kubernetes handles:
+- **Scheduling** — deciding which node each container runs on, based on available resources
+- **Self-healing** — automatically restarting or rescheduling a container that crashes or a node that fails
+- **Scaling** — adding or removing container replicas based on load (Horizontal Pod Autoscaler)
+- **Service discovery & load balancing** — routing traffic to healthy replicas across the cluster, without hardcoding IPs
+- **Rolling updates** — deploying new versions gradually, without downtime
+- **Config/secret management at scale** — ConfigMaps, Secrets, distributed consistently across every replica
+
+Kubernetes answers a different question: *"Given many containers that need to run reliably across many machines, how do I keep them running, scaled correctly, and reachable, without doing it all by hand?"*
+
+---
+
+**Side-by-side**
+
+| | Docker | Kubernetes |
+|---|---|---|
+| **What it is** | Containerization platform | Container orchestration platform |
+| **Scope** | Single host | Multi-node cluster |
+| **Builds images** | Yes — `Dockerfile` → image | No — consumes pre-built images from a registry |
+| **Self-healing** | No — a crashed container stays crashed unless you script a restart policy | Yes — built in, automatically restarts/reschedules failures |
+| **Scaling** | Manual, or `docker-compose scale` (still single-host) | Native, cluster-wide (Deployments + HPA) |
+| **Load balancing across hosts** | Not built in | Built in, via Services |
+| **Rolling updates** | Not built in | Built in (`RollingUpdate` strategy) |
+| **Cross-host networking** | Not native | Built in, via CNI plugins |
+
+---
+
+**A genuinely important nuance — Kubernetes doesn't actually run on Docker anymore**
+
+This surprises people who haven't looked closely: modern Kubernetes clusters, including **EKS**, don't use Docker Engine as the thing that actually runs containers on each node at all. Kubernetes talks to node-level container runtimes through a standard interface called the **Container Runtime Interface (CRI)** — implemented by **containerd** or **CRI-O**, not Docker Engine directly. There used to be a compatibility shim (**dockershim**) that let Kubernetes talk to Docker Engine specifically, but that was **removed in Kubernetes v1.24** — Docker Engine is no longer a supported runtime for running the containers Kubernetes schedules.
+
+This doesn't mean Docker became irrelevant to the Kubernetes workflow — quite the opposite: you still very commonly use `docker build` (or an equivalent OCI-image builder like Buildah or Kaniko in CI) to **build** the image. That image, once built, is a standard **OCI-format image** — Kubernetes doesn't care what tool built it. It gets pushed to a registry (ECR, Docker Hub), and Kubernetes nodes pull and run it via **containerd**, entirely independent of whether Docker Engine is even installed on those nodes at all.
+
+A simple mental model: **Docker builds the shipping container and can drive one truck. Kubernetes is the entire port and logistics system — deciding which ship, which truck, rerouting around a breakdown, scaling the whole fleet up or down** — it doesn't care what built the container in the first place, as long as it's in the right format.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart's actual pipeline reflects exactly this split: engineers write a `Dockerfile`, CI builds the image with `docker build`, pushes it to **ECR**, and our **EKS** cluster pulls and runs it as pods via Kubernetes Deployments. Docker is genuinely only involved in the **build** step of that pipeline — the EKS worker nodes themselves run **containerd**, not Docker Engine.
+
+We had a very concrete moment where this distinction mattered: a new engineer, trying to inspect what was running on an EKS worker node the way they were used to on a plain EC2 box, SSH'd in and ran `docker ps` — and got a "command not found" error, because Docker Engine simply isn't installed on our EKS nodes at all. The correct tool on a containerd-based node is `crictl ps` — the CRI-compatible equivalent — which took a few minutes of confusion to figure out, and is now something we specifically call out in onboarding docs, precisely because "EKS runs on Docker" is such a common, reasonable-sounding assumption that turns out to be wrong on any reasonably current cluster.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Not competitors — different layers, used together:
+
+Building/packaging an app into a portable, standardized unit?
+  → Docker (or an equivalent OCI-image builder) — this is a
+    BUILD-time concern
+
+Running that unit reliably, at scale, across many machines — with
+self-healing, scaling, load balancing, rolling updates?
+  → Kubernetes — this is a RUN-time, cluster-wide concern
+
+Does Kubernetes actually use Docker to run containers?
+  → Not anymore on any current cluster — it uses a CRI-compliant
+    runtime (containerd/CRI-O). dockershim was removed in v1.24.
+    Docker is still commonly used to BUILD the image; something
+    else runs it once Kubernetes schedules it.
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"They're not alternatives — they solve different problems at different layers. Docker is a containerization platform: it builds a container image from a Dockerfile and runs it on a single host. Kubernetes is an orchestration platform: given many containers that need to run across many machines, it handles scheduling, self-healing, scaling, load balancing, and rolling updates — none of which Docker does on its own. The nuance I'd make sure to mention is that modern Kubernetes, including EKS, doesn't actually use Docker Engine to run containers anymore — it talks to containerd or CRI-O through the Container Runtime Interface, since the Docker compatibility shim was removed in Kubernetes 1.24. Docker is still very much part of the workflow, just at the build step — you build the image with Docker, push it to a registry, and Kubernetes pulls and runs that image using a different runtime under the hood. They work together in the pipeline; they're not two ways of doing the same thing."*
+
+---
+
+<!-- Add more scenario questions as Scenario 1, Scenario 2... -->
+
+---
+
 <!--
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #2
+## Interview #3
 
 **Company:**
 **Date:**
