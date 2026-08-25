@@ -31,6 +31,10 @@
   - [Scenario 5. Customer wants Read-Only access to an existing Resource Group](#scenario-5-you-have-an-existing-terraform-managed-azure-environment-a-customer-wants-read-only-access-to-an-existing-resource-group-how-would-you-implement-this)
   - [Scenario 6. Terraform Plan detects Drift — Customer confirms valid vs not valid](#scenario-6-suppose-terraform-plan-detects-drift-how-would-you-proceed-and-customer-confirms-the-drift-is-valid-how-would-you-proceed-what-if-the-customer-says-the-drift-is-not-valid)
 - [Interview #2 — Accenture | DevOps Engineer | Technical Round 1](#interview-2)
+- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
+  - [Q1. Define an Azure Virtual Network (VNet) with a given IP range](#q1-define-an-azure-virtual-network-vnet-with-a-given-ip-range)
+  - [Q2. Set up an Azure Bastion Host for secure access to the VMs](#q2-set-up-an-azure-bastion-host-for-secure-access-to-the-vms)
+  - [Q3. Configure an Azure Load Balancer to route traffic to the application VMs](#q3-configure-an-azure-load-balancer-to-route-traffic-to-the-application-vms)
   - [Q1. What happens when we run terraform init?](#q1-what-happens-when-we-run-terraform-init)
   - [Q2. Write a Terraform script to create an EC2 instance in multiple regions](#q2-write-a-terraform-script-to-create-an-ec2-instance-in-multiple-regions)
 
@@ -5443,10 +5447,428 @@ Did I hardcode one AMI ID for all regions?
 
 ---
 
+## Interview #3
+
+**Company:** Wipro
+**Date:** 23-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Not specified
+
+---
+
+### Questions Asked
+
+#### Q1. Define an Azure Virtual Network (VNet) with a given IP range
+
+**Answer:**
+
+A **Virtual Network (VNet)** is Azure's equivalent of an AWS VPC — the fundamental network isolation boundary everything else (subnets, NSGs, VMs, AKS clusters) gets deployed into. Defining one means specifying an **address space** (one or more CIDR blocks) and then subdividing it into **subnets** — conceptually identical to the AWS VPC/CIDR planning already covered, but with a few real, non-obvious differences in how Azure actually implements it.
+
+---
+
+**Defining it in Terraform — the standard, production way**
+
+```hcl
+resource "azurerm_resource_group" "azureshop" {
+  name     = "rg-azureshop-prod"
+  location = "East US"
+}
+
+resource "azurerm_virtual_network" "main" {
+  name                = "vnet-azureshop-prod"
+  address_space       = ["10.50.0.0/16"]
+  location            = azurerm_resource_group.azureshop.location
+  resource_group_name = azurerm_resource_group.azureshop.name
+}
+
+resource "azurerm_subnet" "app" {
+  name                 = "snet-app"
+  resource_group_name  = azurerm_resource_group.azureshop.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = ["10.50.1.0/24"]
+}
+
+resource "azurerm_subnet" "data" {
+  name                 = "snet-data"
+  resource_group_name  = azurerm_resource_group.azureshop.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = ["10.50.2.0/24"]
+}
+```
+
+**Two syntax details worth calling out explicitly:**
+- **`address_space` takes a list**, not a single string — `["10.50.0.0/16"]` — because a Azure VNet can actually be given **multiple, non-contiguous address spaces** at creation, not just one.
+- **Subnets are their own separate resource** (`azurerm_subnet`), referencing the parent VNet by name — not nested inline inside the `azurerm_virtual_network` block. Defining subnets inline used to be possible in older provider versions but is now explicitly discouraged, since Terraform can't independently manage a subnet's lifecycle (updates, imports, dependencies) as cleanly when it's buried inside the parent resource instead of being its own resource.
+- **`address_prefixes` is plural** (a list) even for one CIDR block, per subnet — an easy typo trap (`address_prefix`, singular, doesn't exist as an argument on the current resource).
+
+---
+
+**The Azure CLI equivalent — useful to know both ways exist**
+
+```bash
+az network vnet create \
+  --name vnet-azureshop-prod \
+  --resource-group rg-azureshop-prod \
+  --address-prefix 10.50.0.0/16 \
+  --subnet-name snet-app \
+  --subnet-prefix 10.50.1.0/24
+```
+
+I'd only use this for a quick manual test — anything real goes through Terraform, for exactly the reasons covered in the earlier Terraform Pull Request review question: version-controlled, reviewable, drift-detectable infrastructure changes.
+
+---
+
+**A real, non-obvious Azure-vs-AWS difference worth flagging proactively**
+
+This is the detail I'd make sure to mention unprompted, because it genuinely trips up engineers translating AWS patterns directly to Azure: **in AWS, a subnet is created inside one specific Availability Zone** — you pick the AZ at subnet-creation time, and true multi-AZ resilience means one subnet per AZ. **In Azure, a subnet is NOT tied to a specific Availability Zone at all** — resources deployed into a single Azure subnet can land in any zone within the region. Zone redundancy in Azure is typically handled at the **resource level** instead — a zone-redundant Load Balancer, or explicitly specifying `zones = ["1", "2", "3"]` on a VM Scale Set — not by creating a separate subnet per zone the way AWS requires. Someone bringing an AWS mental model straight into Azure will often over-engineer subnet design with one subnet per zone, which isn't how Azure's zone model actually works.
+
+---
+
+**AWS VPC vs. Azure VNet — the direct comparison**
+
+| Concept | AWS | Azure |
+|---|---|---|
+| Network container | VPC | Virtual Network (VNet) |
+| IP range | CIDR block(s), `/16`–`/28` | `address_space` — a list of CIDR blocks |
+| Subnet ↔ Availability Zone | **Tied** — one subnet lives in one specific AZ | **Not tied** — a subnet spans the whole region; zone redundancy is handled per-resource instead |
+| Reserved IPs per subnet | 5 | 5 (slightly different roles — see below) |
+| Peering requires non-overlapping ranges | Yes | Yes |
+| Scope | Regional | Regional |
+
+**Azure reserves 5 IPs per subnet too — same count, different specific roles than AWS:**
+
+| Address | Reserved for |
+|---|---|
+| `x.x.x.0` | Network address |
+| `x.x.x.1` | Default gateway |
+| `x.x.x.2`, `x.x.x.3` | Mapped to Azure's DNS services |
+| `x.x.x.255` (last address) | Broadcast address |
+
+So a `/24` subnet in Azure gives the same **251 usable** addresses as in AWS — the exact same gotcha from the AWS "reserved IPs" question applies here too, just with the middle two addresses split slightly differently.
+
+---
+
+**Real-world example — AzureShop**
+
+AzureShop's production VNet is sized as a `/16` (`10.50.0.0/16`), following the same "size generously up front" reasoning as AWS VPC planning — subdivided into `/24` subnets per tier (app, data), with large unused ranges deliberately reserved for future tiers.
+
+A concrete lesson learned: when we first designed this VNet, an engineer who'd previously worked mostly in AWS proposed creating **one subnet per Availability Zone** — directly copying the AWS pattern — before we realized that's not how Azure's zone model works at all; Azure subnets aren't zone-scoped, so that design would have been unnecessary complexity solving a problem Azure doesn't require you to solve at the subnet level.
+
+Separately, when connecting AzureShop's VNet to a partner's VNet via **VNet Peering** for a shared integration, the peering request failed — both VNets had been independently provisioned with the same default `10.0.0.0/16` range, exactly the same class of overlap incident described in the AWS VPC CIDR-planning discussion. The fix was the same lesson learned there too: stop letting individual teams pick VNet ranges ad hoc, and centrally plan address space allocation across the organization instead — Azure's equivalent tooling for this is **Azure Virtual Network Manager**, which can centrally define and enforce non-overlapping address space across many VNets, similar in spirit to AWS VPC IPAM.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Define the VNet:
+  → azurerm_virtual_network — address_space is a LIST of CIDR blocks
+  → azurerm_subnet — a SEPARATE resource per subnet, not inline —
+    address_prefixes is also a list, even for one CIDR
+
+Size it the same way as an AWS VPC:
+  → Generous up front (e.g., /16), never overlapping with anything
+    you might ever peer/connect to, centrally planned across the org
+
+The one thing to flag proactively, unprompted:
+  → Azure subnets are NOT tied to a specific Availability Zone,
+    unlike AWS — don't carry over "one subnet per AZ" as a pattern,
+    zone redundancy is handled per-resource in Azure instead
+
+Same 5-reserved-IPs-per-subnet gotcha as AWS applies here too —
+just a slightly different breakdown of what each reserved address is for
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"An Azure VNet is defined with the `azurerm_virtual_network` resource, giving it an `address_space` — a list of CIDR blocks, since a VNet can actually have more than one — and then subnets are created as their own separate `azurerm_subnet` resources referencing it, each with an `address_prefixes` list rather than nesting them inline in the VNet block. I'd size it the same way I'd size an AWS VPC — generously, like a `/16`, and centrally planned so it never overlaps with anything it might need to peer with later. The detail I'd make sure to mention proactively is that, unlike AWS, an Azure subnet isn't tied to a specific Availability Zone at all — it spans the whole region, and zone redundancy gets handled at the resource level instead, like a zone-redundant load balancer or explicit zones on a VM Scale Set — so a 'one subnet per AZ' design, which is standard in AWS, doesn't apply the same way in Azure and would just be unnecessary complexity. Azure also reserves 5 IP addresses per subnet, same count as AWS, just split slightly differently — the default gateway and Azure's DNS services take the middle addresses instead."*
+
+---
+
+#### Q2. Set up an Azure Bastion Host for secure access to the VMs
+
+**Answer:**
+
+**Azure Bastion** is Azure's fully managed PaaS service for secure RDP/SSH access to VMs — the direct architectural equivalent of what AWS Session Manager does, just implemented differently: instead of an agent-based, outbound-initiated model like SSM, Bastion is a **gateway service deployed into your own VNet** that you connect to over HTTPS (443) through the Azure Portal or a native client, which then tunnels the RDP/SSH session to the target VM over its **private** IP. The VM itself never needs a public IP, and no NSG rule ever has to open RDP (3389) or SSH (22) to the internet.
+
+---
+
+**Why this replaces a traditional self-managed jump box**
+
+A traditional bastion — a VM you stand up yourself in a public subnet, with a public IP and open inbound SSH/RDP — has real downsides: it's a VM you have to patch and maintain like any other, it's itself directly internet-exposed, and if it's ever compromised, it's a single pivot point into the entire private network behind it. Azure Bastion removes all of that: there's **no VM for you to manage or patch** — it's a managed service — and it's deployed with tightly scoped requirements rather than being just another general-purpose VM with SSH open to the world.
+
+---
+
+**Setup, step by step**
+
+**1. Create a dedicated subnet — and the name is not optional**
+
+Azure Bastion must be deployed into a subnet named **exactly** `AzureBastionSubnet` — this specific name is a hard requirement; Bastion will refuse to deploy into a subnet with any other name. Minimum recommended size is a `/26`, to leave room for the service to scale.
+
+```hcl
+resource "azurerm_subnet" "bastion" {
+  name                 = "AzureBastionSubnet"   # exact name — required, not a suggestion
+  resource_group_name  = azurerm_resource_group.azureshop.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = ["10.50.100.0/26"]
+}
+```
+
+**2. Deploy the Bastion resource itself, with its own dedicated Public IP**
+
+```hcl
+resource "azurerm_public_ip" "bastion" {
+  name                = "pip-bastion-azureshop"
+  location            = azurerm_resource_group.azureshop.location
+  resource_group_name = azurerm_resource_group.azureshop.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_bastion_host" "main" {
+  name                = "bastion-azureshop-prod"
+  location            = azurerm_resource_group.azureshop.location
+  resource_group_name = azurerm_resource_group.azureshop.name
+  sku                 = "Standard"       # Standard adds native client support, VM scaling, more
+
+  ip_configuration {
+    name                 = "bastion-ipconfig"
+    subnet_id            = azurerm_subnet.bastion.id
+    public_ip_address_id = azurerm_public_ip.bastion.id
+  }
+}
+```
+
+This public IP is the **only** public IP in the entire picture — it belongs to the Bastion service, never to any of the actual VMs being accessed.
+
+**3. NSG rules on the Bastion subnet**
+
+Microsoft publishes a specific, required set of NSG rules for `AzureBastionSubnet` — inbound HTTPS from the internet (users connect to Bastion itself over 443), plus specific rules for Bastion's own control-plane/health-check traffic and outbound rules to the target VNet on RDP/SSH. I'd always pull the current exact rule set from Microsoft's documentation rather than reconstruct it from memory — getting even one of these rules wrong is a common reason Bastion deployments fail silently.
+
+```hcl
+resource "azurerm_network_security_group" "bastion" {
+  name                = "nsg-bastion"
+  location            = azurerm_resource_group.azureshop.location
+  resource_group_name = azurerm_resource_group.azureshop.name
+
+  security_rule {
+    name                       = "AllowHttpsInbound"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "Internet"
+    destination_address_prefix = "*"
+  }
+  # ...plus the remaining rules Microsoft documents as required for Bastion to function
+}
+```
+
+**4. Remove public IPs from the target VMs entirely**
+
+This is the actual security payoff — once Bastion is in place, no VM needs a public IP at all. Any existing public IP association on a target VM should be removed, and any NSG rule allowing inbound RDP/SSH from the internet should be deleted.
+
+**5. Connect**
+
+In the Azure Portal: select the VM → **Connect** → **Bastion** → enter credentials → get an in-browser RDP/SSH session, no client software needed. With the **Standard SKU**, native client support also lets engineers connect using their own local RDP/SSH tools while Bastion still tunnels the session — useful for people who prefer their own tooling over a browser-based session.
+
+---
+
+**Comparison to AWS Session Manager — the same underlying goal, different implementation**
+
+| | Azure Bastion | AWS Session Manager (SSM) |
+|---|---|---|
+| Model | PaaS gateway deployed into your VNet | Agent on each instance, outbound to AWS's control plane |
+| Public IP on the target VM/instance | Never needed | Never needed |
+| Public IP needed anywhere | Yes — one, on the Bastion resource itself | No — fully agent-initiated, no public IP anywhere at all |
+| Access method | Azure Portal / native client, via Bastion | AWS CLI/Console, via Session Manager |
+| Cost | Hourly + data processing charge for the Bastion host itself | No additional charge beyond the instance |
+| Auditing | Bastion session logs, NSG flow logs | CloudTrail, optional full session logging to S3/CloudWatch |
+
+The philosophy is identical — eliminate standing SSH/RDP exposure entirely — but AWS's model needs zero public IPs anywhere in the picture, while Azure Bastion still requires exactly one, on the Bastion service itself, since it's a gateway you connect *into* rather than an agent that reaches *out*.
+
+---
+
+**Real-world example — AzureShop**
+
+AzureShop originally used a self-managed jump-box VM — a public IP, an open inbound RDP rule, and SSH/RDP credentials shared among several engineers, the exact same anti-pattern already described for the pre-SSM AWS setup. Migrating to Azure Bastion followed the steps above, and we hit the classic first-time mistake immediately: the subnet was initially named `subnet-bastion` instead of the exact required `AzureBastionSubnet`, and the Bastion deployment failed outright until the subnet was recreated with the correct name.
+
+After migration, every VM's public IP was removed, every inbound RDP/SSH NSG rule from the internet was deleted, and access now goes entirely through Bastion, authenticated against **Azure AD (Entra ID)** logins tied to the Portal — no more shared SSH keys, and every session is logged, giving us a real audit trail of who accessed which VM and when, which the old shared-credential jump box never provided at all.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Same goal as AWS Session Manager — eliminate standing SSH/RDP
+exposure — different mechanism (PaaS gateway vs. agent-based)
+
+1. Dedicated subnet, EXACT name "AzureBastionSubnet", /26 recommended
+2. Deploy azurerm_bastion_host into it, with its own Standard SKU
+   Public IP — the only public IP in the whole picture
+3. NSG rules on that subnet — pull the exact required set from
+   Microsoft's docs, don't guess
+4. Remove public IPs and open RDP/SSH NSG rules from every target VM
+5. Connect via Portal (browser) or native client (Standard SKU)
+
+Gotcha to flag proactively: the subnet NAME is a hard requirement,
+not a convention — get it wrong and deployment fails outright
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Azure Bastion is a managed PaaS gateway that gives RDP/SSH access to VMs over HTTPS through the Azure Portal, without the VM ever needing a public IP or an open inbound RDP/SSH rule — the same underlying goal as AWS Session Manager, eliminating standing exposure and a self-managed jump box, just implemented as a gateway service instead of an agent-based model. To set it up: create a subnet with the exact required name AzureBastionSubnet — that name isn't a convention, Bastion won't deploy without it — deploy the Bastion resource into it with its own dedicated Standard SKU public IP, which is the only public IP anywhere in the picture, configure the specific NSG rules Microsoft documents as required, and then remove public IPs and any open RDP/SSH rules from every target VM. Engineers then connect through the Portal for a browser-based session, or via native client support on the Standard SKU if they want to use their own RDP/SSH tools. I'd also flag the subnet naming requirement specifically, since getting that wrong — naming it anything else — is a very common first-time deployment failure."*
+
+---
+
+#### Q3. Configure an Azure Load Balancer to route traffic to the application VMs
+
+**Answer:**
+
+Before writing any config, I'd clarify one thing that trips a lot of people up: **"Azure Load Balancer" specifically refers to Azure's Layer 4 (TCP/UDP) load balancer** — it distributes traffic based on IP protocol and port, with no awareness of HTTP content at all. If the actual requirement is HTTP-aware routing — path-based rules, host-based routing, SSL offload, a WAF — that's a **different service, Azure Application Gateway** (Layer 7), not Azure Load Balancer. The AWS parallel makes this instantly clear: **Azure Load Balancer ≈ AWS NLB, Azure Application Gateway ≈ AWS ALB.** I'd confirm which one the requirement actually needs before configuring anything.
+
+Assuming the requirement genuinely is TCP-level load balancing across a set of VMs — here's the setup.
+
+---
+
+**The core components of an Azure Load Balancer**
+
+| Component | What it does |
+|---|---|
+| **Frontend IP configuration** | The IP address (public or private) clients actually connect to |
+| **Backend address pool** | The set of VMs (or VM Scale Set instances) that receive the distributed traffic |
+| **Health probe** | Periodically checks each backend VM's health — only healthy VMs receive traffic, the same underlying idea as an AWS target group health check |
+| **Load balancing rule** | Ties a frontend IP+port to a backend pool+port, referencing which health probe to use |
+
+**Public vs. Internal Load Balancer** — same public/private distinction already established for AWS: a **Public Load Balancer** has a public IP and load balances internet-facing traffic (the VMs behind it stay entirely private); an **Internal Load Balancer** has only a private IP, used for load balancing traffic between tiers inside the VNet without exposing anything externally.
+
+**SKU**: **Standard**, not Basic — Basic is being phased out, and Standard is what supports Availability Zone redundancy, larger backend pools, and more granular health probes.
+
+---
+
+**Terraform configuration**
+
+```hcl
+resource "azurerm_public_ip" "lb" {
+  name                = "pip-lb-azureshop"
+  location            = azurerm_resource_group.azureshop.location
+  resource_group_name = azurerm_resource_group.azureshop.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_lb" "main" {
+  name                = "lb-azureshop-prod"
+  location            = azurerm_resource_group.azureshop.location
+  resource_group_name = azurerm_resource_group.azureshop.name
+  sku                 = "Standard"
+
+  frontend_ip_configuration {
+    name                 = "frontend"
+    public_ip_address_id = azurerm_public_ip.lb.id
+  }
+}
+
+resource "azurerm_lb_backend_address_pool" "app" {
+  loadbalancer_id = azurerm_lb.main.id
+  name            = "app-backend-pool"
+}
+
+resource "azurerm_lb_probe" "http" {
+  loadbalancer_id     = azurerm_lb.main.id
+  name                = "http-probe"
+  protocol            = "Http"
+  request_path        = "/health"
+  port                = 80
+  interval_in_seconds = 5
+  number_of_probes    = 2
+}
+
+resource "azurerm_lb_rule" "http" {
+  loadbalancer_id                = azurerm_lb.main.id
+  name                            = "http-rule"
+  protocol                        = "Tcp"
+  frontend_port                   = 80
+  backend_port                    = 80
+  frontend_ip_configuration_name  = "frontend"
+  backend_address_pool_ids        = [azurerm_lb_backend_address_pool.app.id]
+  probe_id                        = azurerm_lb_probe.http.id
+}
+
+# Attach each VM's network interface to the backend pool
+resource "azurerm_network_interface_backend_address_pool_association" "app" {
+  network_interface_id    = azurerm_network_interface.app_vm.id
+  ip_configuration_name   = "internal"
+  backend_address_pool_id = azurerm_lb_backend_address_pool.app.id
+}
+```
+
+For a real application tier, I'd back the pool with a **VM Scale Set** rather than individually-attached standalone VMs — VMSS integrates natively with the backend pool and handles adding/removing instances as it scales, without needing a separate association resource per VM.
+
+---
+
+**HA — the same principle as everywhere else in this interview: the load balancer alone isn't HA**
+
+A Load Balancer routes traffic to healthy backends — it doesn't create redundancy on its own. Real HA needs: the **Standard SKU** (zone-redundant frontend IP), backend VMs/VMSS instances spread across **multiple Availability Zones**, and a **minimum of 2+ instances** so losing one doesn't take the service down. This is the exact same lesson from the AWS EC2-to-private-subnet migration question — moving into the "right" networking setup doesn't deliver HA by itself; redundant, health-checked backend capacity does.
+
+---
+
+**Real-world example — AzureShop**
+
+AzureShop's actual public-facing storefront runs through **Application Gateway**, not Azure Load Balancer directly, since the requirement genuinely needed path-based routing (`/api/*` to one backend pool, `/` to another) and WAF protection — capabilities Azure Load Balancer, being Layer 4, simply doesn't have. We learned this distinction the hard way: an engineer initially tried to configure path-based routing rules directly on an Azure Load Balancer and discovered there was no way to do it — Azure Load Balancer has no concept of HTTP paths at all, it only sees TCP connections. Application Gateway was added specifically to handle that requirement, sitting in front of the backend pool.
+
+Azure Load Balancer's actual role at AzureShop is as an **Internal Load Balancer** between internal tiers — for example, distributing traffic from the app tier to a set of backend VMs running a TCP-based internal service, where there's no HTTP path-routing requirement at all, just "spread TCP connections across healthy instances." That's the distinction I'd make sure to draw in the interview: it's not that one service is "better" than the other, it's that they solve genuinely different problems, and picking the wrong one means hitting a capability wall partway through implementation.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+First question: does this actually need Layer 4 or Layer 7?
+
+  Need HTTP-aware routing (path/host rules, SSL offload, WAF)?
+    → Application Gateway (≈ AWS ALB), not Azure Load Balancer
+
+  Just need to distribute TCP/UDP connections across VMs,
+  no HTTP awareness needed?
+    → Azure Load Balancer (≈ AWS NLB) — this is genuinely the
+      right tool
+
+Then, for Azure Load Balancer specifically:
+  → Public (internet-facing) or Internal (private, inter-tier)?
+  → Standard SKU (not Basic — being retired, lacks zone redundancy)
+  → Frontend IP + backend pool + health probe + load balancing rule
+  → Backend pool backed by a VM Scale Set for real elasticity,
+    not individually-managed standalone VMs
+
+HA reminder: the load balancer routes to healthy backends — it
+doesn't create redundancy. Need Standard SKU zone redundancy +
+multiple AZs + 2+ backend instances for that.
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"First I'd confirm this genuinely needs Layer 4 load balancing — Azure Load Balancer distributes TCP/UDP traffic with no HTTP awareness at all, the equivalent of an AWS NLB. If the actual need is path-based routing, SSL offload, or a WAF, that's Application Gateway instead, Azure's Layer 7 service, equivalent to an AWS ALB — picking the wrong one means hitting a capability wall partway through. Assuming Layer 4 is genuinely right: I'd configure a Standard SKU load balancer, since Basic is being retired and lacks zone redundancy, with a frontend IP configuration, a backend address pool pointing at the application VMs — ideally a VM Scale Set rather than individually managed VMs — a health probe checking a real health endpoint, and a load balancing rule tying the frontend port to the backend pool via that probe. For real HA, I'd make sure the backend has at least two instances spread across Availability Zones, since the load balancer itself only routes to healthy backends — it doesn't create the redundancy on its own."*
+
+---
+
+<!-- Add more scenario questions as Scenario 1, Scenario 2... -->
+
+---
+
 <!-- 
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #3
+## Interview #4
 
 **Company:**  
 **Date:**  
