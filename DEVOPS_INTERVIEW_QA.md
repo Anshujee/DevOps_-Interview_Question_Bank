@@ -12,6 +12,8 @@
   - [Q2. What is SLA and SLO?](#q2-what-is-sla-and-slo)
   - [Q3. What is CI/CD? Explain briefly.](#q3-what-is-cicd-explain-briefly)
   - [Q4. A developer has written only source code — design the CI/CD pipeline to deploy it to DEV/QA/PROD using best practices](#q4-a-developer-has-written-only-source-code--design-the-cicd-pipeline-to-deploy-it-to-devqaprod-using-best-practices)
+- [Interview #2 — Wipro | DevOps Engineer | Technical Round 1](#interview-2)
+  - [Q1. Explain Three-Tier Architecture in detail](#q1-explain-three-tier-architecture-in-detail)
 
 ---
 
@@ -355,10 +357,123 @@ Supporting decisions:
 
 ---
 
+## Interview #2
+
+**Company:** Wipro
+**Date:** 23-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Not specified
+
+---
+
+### Questions Asked
+
+#### Q1. Explain Three-Tier Architecture in detail
+
+**Answer:**
+
+Three-tier architecture splits an application into **three distinct layers, each with exactly one responsibility**, communicating only with the layer directly next to it. It's the standard shape for most traditional applications, and it's actually the pattern behind the CloudCart architecture I described earlier in this interview (AWS Q11) — this question is really asking for the general principle underneath that concrete example.
+
+---
+
+**The three tiers**
+
+```
+┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐
+│  Presentation Tier   │ ───▶ │  Application Tier    │ ───▶ │     Data Tier          │
+│                      │      │                      │      │                      │
+│  Web UI / mobile app │      │  Business logic,     │      │  Database, cache,    │
+│  renders UI, handles │      │  validation, request │      │  object storage —    │
+│  user input          │      │  orchestration        │      │  stores/retrieves    │
+│                      │      │                      │      │  data only            │
+└───────────────────┘      └───────────────────┘      └───────────────────┘
+```
+
+1. **Presentation Tier** — what the user directly sees and interacts with: a web UI, a mobile app, or an API surface consumed by a client. Its job is rendering and handling input — it should contain **no business logic and no direct data access**.
+2. **Application Tier** (the "logic" or "business" tier) — the actual brains of the system: validates input, enforces business rules, orchestrates operations (e.g., "check inventory, then charge payment, then create the order record"). This is where application code actually lives.
+3. **Data Tier** — persistent storage: a database, a cache, object storage. Its only job is storing and retrieving data — it holds **no business logic** of its own.
+
+---
+
+**The core rule — and the most important thing to say explicitly**
+
+**Each tier only ever talks to the tier immediately next to it.** The Presentation tier talks to the Application tier; the Application tier talks to the Data tier. **The Presentation tier should never talk directly to the Data tier**, skipping the Application tier in between. This one rule is what the entire pattern is actually built to enforce — everything else (scaling, security, maintainability) follows from respecting it.
+
+---
+
+**Why this separation actually matters**
+
+| Benefit | What it looks like in practice |
+|---|---|
+| **Independent scaling** | Scale out Application-tier compute during a traffic spike without touching the Data tier at all — or add database read replicas without redeploying the app |
+| **Independent technology choices** | React/Vue for Presentation, any backend language for Application, Postgres/Redis/S3 for Data — no tier's tech choice constrains another's |
+| **Security segmentation** | Each tier gets its own network boundary — Data tier reachable **only** from the Application tier's security group, never from Presentation or the internet directly (exactly the AWS pattern from Q5, Interview #1) |
+| **Maintainability** | A UI change doesn't require touching business logic; a business-logic change doesn't require touching the database schema directly |
+| **Reusability** | The same Application tier can serve multiple Presentation tiers — a web UI, a mobile app, a partner API — without duplicating business logic in each one |
+
+---
+
+**Where this sits among the alternatives — worth mentioning to show breadth**
+
+| Model | Shape | Trade-off |
+|---|---|---|
+| **1-tier (monolith on one box)** | UI + logic + data, all on one machine | Simplest, but no separation, doesn't scale |
+| **2-tier (client-server)** | Client talks **directly** to the database, no logic layer in between | Common in legacy desktop apps — tightly coupled, a schema change breaks the client directly, exactly the anti-pattern 3-tier exists to prevent |
+| **3-tier** | Presentation → Application → Data, strictly adjacent-only | The standard, sensible default for most applications |
+| **N-tier / Microservices** | The Application tier itself decomposed into many independently deployable services | An evolution of 3-tier when a single "application tier" becomes too large to manage as one deployable unit — each microservice is often still internally 3-tier shaped |
+
+CloudCart's actual EKS-based setup (Q11) is really this last row: many microservices — order-processing, payments, analytics — each one still following the same presentation→logic→data discipline internally, together forming the overall system.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart's architecture maps directly onto this: a React frontend (Presentation), EKS backend API services (Application), and RDS/ElastiCache/Redshift (Data) — each tier in its own subnet, with security groups enforcing that the Data tier is reachable only from the Application tier's security group, never from Presentation or the internet (Q5, Interview #1).
+
+We hit a real violation of the core rule once: early on, someone added a "quick fix" where a reporting feature in the frontend queried the RDS database **directly**, bypassing the Application tier entirely, for a perceived performance win. This broke the whole point of the separation two ways: a security review flagged that the frontend now held real database credentials — far more access than a presentation-layer component should ever need — and later, an unrelated database schema change broke that reporting feature **unexpectedly**, because there was no Application-tier API shielding it from the raw schema the way every other feature was protected. The fix was routing that reporting feature back through a proper Application-tier API endpoint, restoring the rule — the incident is a good concrete illustration of *why* the "adjacent tiers only" rule exists, not just a theoretical best practice.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Three tiers, one responsibility each:
+  Presentation → renders UI, handles input, NO business logic
+  Application  → business rules, validation, orchestration
+  Data         → storage/retrieval only, NO business logic
+
+The rule that makes it all work:
+  Each tier talks ONLY to the adjacent tier — Presentation never
+  talks directly to Data, always through Application
+
+Why it matters: independent scaling, independent tech choices,
+security segmentation (Data tier most restricted), maintainability,
+reusability (one Application tier can serve multiple Presentation
+tiers)
+
+Where it sits among alternatives:
+  1-tier (monolith) → 2-tier (client-server, the anti-pattern
+  3-tier prevents) → 3-tier (the standard) → N-tier/microservices
+  (3-tier decomposed further, per service)
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Three-tier architecture splits an application into three layers with one responsibility each: Presentation, which renders the UI and handles user input with no business logic of its own; Application, which holds the actual business logic, validation, and orchestration; and Data, which only stores and retrieves data. The rule that makes the whole pattern work is that each tier only talks to the tier immediately next to it — Presentation never talks directly to Data, it always goes through Application. That separation is what enables independently scaling each tier, using the best-fit technology per tier, tightly restricting the Data tier's network access to just the Application tier, and keeping a UI change from ever requiring a change to business logic or the database schema. I'd contrast it briefly with 2-tier, client-server architecture — where the client talks straight to the database with no logic layer in between — which is exactly the tightly-coupled anti-pattern three-tier architecture exists to prevent, and I've seen that exact violation happen in practice: a reporting feature that queried the database directly instead of going through the application layer, which both created a security gap and broke unexpectedly when the schema later changed."*
+
+---
+
+<!-- Add more scenario questions as Scenario 1, Scenario 2... -->
+
+---
+
 <!--
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #2
+## Interview #3
 
 **Company:**
 **Date:**

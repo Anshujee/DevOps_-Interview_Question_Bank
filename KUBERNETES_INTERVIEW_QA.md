@@ -16,6 +16,8 @@
   - [Scenario 1. ImagePullBackOff — Possible Reasons?](#scenario-1-imagepullbackoff----possible-reasons)
   - [Scenario 2. Same image works for another app — only my app gets ImagePullBackOff](#scenario-2-advanced-same-image-same-tag-same-registry-works-for-another-app-only-your-application-gets-imagepullbackoff-what-could-be-the-reason)
 - [Interview #2 — Coforge | DevOps Engineer | Technical Round 1](#interview-2)
+- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
+  - [Q1. How do you limit resource usage in Kubernetes — not through the Deployment YAML, but through the namespace?](#q1-how-do-you-limit-resource-usage-in-kubernetes--not-through-the-deployment-yaml-but-through-the-namespace)
   - [Q1. How does endpoint (API server) authentication work in Kubernetes?](#q1-how-does-endpoint-api-server-authentication-work-in-kubernetes)
   - [Q2. How did you troubleshoot a pod CrashLoopBackOff?](#q2-how-did-you-troubleshoot-a-pod-crashloopbackoff)
   - [Q3. Explain Kubernetes architecture and components and their uses](#q3-explain-kubernetes-architecture-and-components-and-their-uses)
@@ -2809,10 +2811,139 @@ Best way to prove understanding, not just recite the list:
 
 ---
 
+## Interview #3
+
+**Company:** Wipro
+**Date:** 23-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Not specified
+
+---
+
+### Questions Asked
+
+#### Q1. How do you limit resource usage in Kubernetes — not through the Deployment YAML, but through the namespace?
+
+**Answer:**
+
+Setting `resources.requests`/`resources.limits` inside a Deployment's pod spec only governs *that one workload*, and it's entirely opt-in — nothing stops a team from deploying a pod with no limits set at all, or with limits high enough to starve everyone else sharing the cluster. To enforce resource governance **at the namespace level**, regardless of what any individual Deployment YAML does or doesn't specify, Kubernetes provides two purpose-built, namespace-scoped objects: **ResourceQuota** and **LimitRange**. They solve two different, complementary problems.
+
+---
+
+**ResourceQuota — caps the TOTAL resource consumption of an entire namespace**
+
+A `ResourceQuota` sets a hard ceiling on the **aggregate** resource usage across every pod in a namespace — not per-pod, the sum total. It can also cap object counts (number of pods, PVCs, Services), not just compute.
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: analytics
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    persistentvolumeclaims: "10"
+```
+
+This says: everything running in the `analytics` namespace, **combined**, can never request more than 10 CPU cores or 20Gi of memory, can't have limits summing past 20 CPU/40Gi, and can't exceed 50 pods or 10 PVCs at once. If deploying a new pod would push the namespace's aggregate over any of these numbers, the **API server rejects the pod's creation outright** at admission time — this is real, hard enforcement, completely independent of what any Deployment's YAML says about its own resource needs.
+
+---
+
+**LimitRange — sets defaults and min/max bounds PER pod/container within a namespace**
+
+This is the piece that most directly answers "not through the Deployment YAML" — a `LimitRange` can inject sane resource requests/limits into a pod that **didn't specify any at all**, and/or reject a pod whose specified resources fall outside an allowed range:
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: analytics
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu: "250m"
+        memory: "256Mi"
+      max:
+        cpu: "2"
+        memory: "4Gi"
+      min:
+        cpu: "100m"
+        memory: "128Mi"
+```
+
+If a developer deploys a pod into `analytics` with **no `resources` block in the Deployment YAML at all**, this `LimitRange` automatically injects `defaultRequest`/`default` — the pod doesn't run unbounded just because someone forgot to set anything. If a pod *does* specify its own resources but they exceed `max` or fall under `min`, the pod is **rejected at creation** — again, entirely enforced at the namespace level, not by anything in the Deployment itself.
+
+---
+
+**A genuinely important interaction between the two, worth knowing precisely**
+
+If a `ResourceQuota` covering compute resources (`requests.cpu`, `requests.memory`, etc.) exists on a namespace, Kubernetes then **requires every pod in that namespace to have explicit resource requests/limits** — either specified directly in the pod spec, or injected by a `LimitRange`. A pod with genuinely no resource values at all will be **rejected outright** if a ResourceQuota exists and there's no `LimitRange` around to supply defaults. This is exactly why the two are almost always deployed **together** in a real cluster: `LimitRange` guarantees every pod gets sane, bounded values even if the Deployment YAML is silent on the topic, and `ResourceQuota` caps what the namespace can consume in total.
+
+**Verifying both:**
+```bash
+kubectl describe resourcequota team-quota -n analytics
+kubectl describe limitrange default-limits -n analytics
+```
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart runs multiple teams' services on a shared EKS cluster, each team in its own namespace. Before namespace-level governance was in place, one team accidentally deployed a Deployment with a container resource block that effectively left the CPU limit unbounded — a typo in the YAML, not a deliberate choice — and that single misconfigured Deployment ended up consuming enough cluster-wide CPU during a load spike to visibly degrade performance for **every other team's workloads** sharing the same nodes, a classic "noisy neighbor" problem in a multi-tenant cluster. It took manually finding and killing the offending Deployment to restore normal performance for everyone else.
+
+After that incident, every team's namespace got both a `ResourceQuota`, sized against that team's actual negotiated share of total cluster capacity, and a `LimitRange` providing sane per-container defaults and a hard `max` ceiling — so a repeat of the same typo-driven mistake would now be **rejected outright at pod-creation time** instead of quietly degrading the whole cluster before anyone noticed.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Two different, complementary problems:
+
+Want every pod to have SOME sane resource request/limit, even if
+the Deployment YAML forgot to set one, or set something unreasonable?
+  → LimitRange — injects defaults, enforces per-pod/container min/max
+
+Want to cap the TOTAL resource consumption of an entire namespace/
+team, regardless of how many pods exist or what each one requests?
+  → ResourceQuota — hard ceiling on the aggregate, enforced at
+    pod-creation admission time
+
+Important interaction: a ResourceQuota on compute resources REQUIRES
+every pod to have explicit values — LimitRange is what actually
+supplies those defaults so pods aren't simply rejected for omitting
+a resources block
+
+In practice: deploy both together, per-namespace, per-team
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Two namespace-scoped objects handle this, and they solve different problems. ResourceQuota caps the total, aggregate resource consumption of an entire namespace — total CPU, total memory, even object counts like pod or PVC limits — enforced across every pod in the namespace combined, completely independent of what any individual Deployment specifies. LimitRange works at the per-pod or per-container level within a namespace — it can inject default resource requests and limits into a pod that didn't specify any in its Deployment YAML at all, and it can enforce a minimum and maximum so no single pod requests something unreasonable. The important interaction to know: if a ResourceQuota covering compute resources exists on a namespace, Kubernetes requires every pod to have explicit resource values, so a LimitRange is what actually supplies sane defaults rather than pods simply getting rejected for omitting a resources block. In practice I'd always deploy both together per namespace — I've seen a shared cluster degrade for every team because one team's Deployment had an effectively unbounded resource typo, and adding both objects per namespace afterward meant that exact mistake would be rejected at pod-creation time instead of silently starving everyone else."*
+
+---
+
+<!-- Add more scenario questions as Scenario 1, Scenario 2... -->
+
+---
+
 <!--
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #3
+## Interview #4
 
 **Company:**
 **Date:**
