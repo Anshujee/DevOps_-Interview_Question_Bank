@@ -21,6 +21,7 @@
   - [Q3. Explain Kubernetes architecture and components and their uses](#q3-explain-kubernetes-architecture-and-components-and-their-uses)
 - [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
   - [Q1. How do you limit resource usage in Kubernetes — not through the Deployment YAML, but through the namespace?](#q1-how-do-you-limit-resource-usage-in-kubernetes--not-through-the-deployment-yaml-but-through-the-namespace)
+  - [Q2. What is the purpose of using a CNI (Container Network Interface) in Kubernetes?](#q2-what-is-the-purpose-of-using-a-cni-container-network-interface-in-kubernetes)
 
 ---
 
@@ -2933,6 +2934,103 @@ In practice: deploy both together, per-namespace, per-team
 **Summary (what to say if time is short):**
 
 *"Two namespace-scoped objects handle this, and they solve different problems. ResourceQuota caps the total, aggregate resource consumption of an entire namespace — total CPU, total memory, even object counts like pod or PVC limits — enforced across every pod in the namespace combined, completely independent of what any individual Deployment specifies. LimitRange works at the per-pod or per-container level within a namespace — it can inject default resource requests and limits into a pod that didn't specify any in its Deployment YAML at all, and it can enforce a minimum and maximum so no single pod requests something unreasonable. The important interaction to know: if a ResourceQuota covering compute resources exists on a namespace, Kubernetes requires every pod to have explicit resource values, so a LimitRange is what actually supplies sane defaults rather than pods simply getting rejected for omitting a resources block. In practice I'd always deploy both together per namespace — I've seen a shared cluster degrade for every team because one team's Deployment had an effectively unbounded resource typo, and adding both objects per namespace afterward meant that exact mistake would be rejected at pod-creation time instead of silently starving everyone else."*
+
+---
+
+#### Q2. What is the purpose of using a CNI (Container Network Interface) in Kubernetes?
+
+**Answer:**
+
+Kubernetes itself deliberately **does not implement pod networking** — it defines a networking *model* (a set of rules every implementation must satisfy) and delegates the actual job of wiring that networking up to a pluggable component: the **CNI plugin**. The purpose of CNI is to be that pluggable, standardized boundary between "Kubernetes needs a pod to have working networking" and "here's exactly how that networking gets implemented on this particular infrastructure."
+
+---
+
+**The Kubernetes networking model — what any CNI plugin must satisfy**
+
+Kubernetes requires, as a hard rule, regardless of which CNI plugin is used:
+- **Every pod gets its own unique IP address** — no port-mapping/NAT between containers in a pod and the node, unlike plain Docker's default networking.
+- **Pods can reach every other pod's IP directly, cluster-wide, without NAT** — a pod on Node A can talk to a pod on Node B using its IP exactly as if they were on the same L2 network, even though they physically aren't.
+- **A node can reach any pod running on it without NAT.**
+
+Kubernetes defines *that contract* — it doesn't care **how** it's satisfied. That "how" is exactly what a CNI plugin provides, which is why the same Kubernetes core can run identically on bare metal, AWS, Azure, GCP, or a laptop — only the CNI plugin underneath changes.
+
+---
+
+**What a CNI plugin actually does, concretely, when a pod is scheduled**
+
+```
+kubelet on the node → calls the configured CNI plugin → plugin:
+  1. Allocates an IP address to the new pod (from a pool it manages)
+  2. Creates a virtual network interface for the pod, attaches it to
+     the node's networking (usually a veth pair into a bridge/overlay)
+  3. Sets up routes so that IP is reachable from other nodes in the
+     cluster
+  4. Tears all of this down cleanly when the pod is deleted
+```
+This happens on **every single pod creation/deletion**, via the CNI spec — a standard interface kubelet calls, regardless of which specific plugin is configured.
+
+---
+
+**Why this needs to be pluggable at all — the real reason CNI exists**
+
+Different environments need genuinely different networking implementations, and hardcoding one into Kubernetes core would make it far less portable:
+
+| Environment | Typical CNI approach | Why |
+|---|---|---|
+| **AWS (EKS)** | **AWS VPC CNI** — pods get real IPs directly from the VPC's subnet | Pods are first-class VPC citizens — reachable from other VPC resources, security groups apply directly, no extra encapsulation overhead |
+| **Azure (AKS)** | **Azure CNI** — pods get IPs from the VNet subnet, vs. **kubenet** where pods get IPs from a separate overlay range NAT'd at the node | Azure CNI trades subnet IP consumption for pods being directly VNet-routable and visible to Azure-native tooling (NSGs, VNet peering) |
+| **On-prem / bare metal** | **Calico**, **Cilium**, **Flannel** | No cloud-native "give me a VPC IP" API to lean on — these build their own overlay (VXLAN) or BGP-based routing between nodes |
+| **Security-heavy clusters** | **Calico** or **Cilium** specifically | Both additionally enforce Kubernetes `NetworkPolicy` — not every CNI plugin does; Flannel, for example, does **not** enforce NetworkPolicy on its own |
+
+The purpose, stated plainly: **CNI decouples "how do I run Kubernetes' required networking model" from "what does my specific infrastructure look like," and lets that networking implementation be swapped based on the platform's constraints and the team's needs** — without ever having to touch Kubernetes core itself.
+
+---
+
+**Beyond basic connectivity — what a more advanced CNI plugin adds**
+
+A minimal CNI plugin (like Flannel) satisfies only the base connectivity contract. More advanced plugins add real, security-relevant features **on top of** that same CNI mechanism:
+- **NetworkPolicy enforcement** — Calico/Cilium actually implement the `NetworkPolicy` objects Kubernetes lets you define (allow/deny traffic between pods by label/namespace); a CNI plugin that doesn't support this will silently ignore NetworkPolicy objects entirely.
+- **Encryption in transit** — some CNI plugins (Cilium with WireGuard, Calico with IPsec) can transparently encrypt pod-to-pod traffic across nodes.
+- **Observability** — Cilium in particular (via eBPF) can give deep, per-flow network visibility between pods, which plain routing-only CNIs don't provide.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart runs on AKS, using **Azure CNI** rather than the simpler `kubenet` mode, specifically because pods needed to be directly addressable and visible to Azure-native networking constructs — NSGs applied to pod traffic the same way they apply to any other VNet resource, and a downstream on-prem system connected via VNet peering needed to reach specific pods directly by IP, which `kubenet`'s NAT'd overlay IPs would have made significantly harder to reason about and route correctly. The trade-off we explicitly accepted was subnet IP exhaustion risk — Azure CNI consumes a real VNet IP per pod, not just per node, so the AKS subnet had to be sized generously up front (this is the same subnet-sizing exercise from the AWS Q2/Q3 CIDR-planning questions, just on the Azure side) to avoid running out of IPs as the cluster scaled.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Why does CNI need to exist at all?
+  → Kubernetes defines a networking MODEL (every pod gets a unique
+    IP, pod-to-pod reachable cluster-wide without NAT) but doesn't
+    implement it itself — CNI is the pluggable boundary that does
+
+What does a CNI plugin actually do?
+  → Allocate pod IP, wire up the virtual interface, set up routes
+    for cross-node reachability, clean up on pod deletion — called
+    by kubelet on every pod create/delete
+
+Why pluggable instead of one built-in implementation?
+  → Different infra needs genuinely different approaches: cloud VPC-
+    native IPs (AWS VPC CNI, Azure CNI) vs. overlay/BGP for bare
+    metal (Calico, Flannel, Cilium) — same Kubernetes core runs
+    everywhere, only the CNI plugin changes
+
+What separates a basic CNI from an advanced one?
+  → NetworkPolicy enforcement, encryption in transit, deep
+    observability (Cilium/eBPF) — not every plugin provides these
+    on top of base connectivity
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Kubernetes defines a networking model — every pod gets its own unique IP, and any pod can reach any other pod cluster-wide without NAT — but it deliberately doesn't implement that itself. CNI is the pluggable standard interface that does: kubelet calls the configured CNI plugin on every pod creation to allocate an IP, wire up the pod's network interface, and set up routing so it's reachable from other nodes, and calls it again on deletion to clean up. The purpose of making this pluggable rather than built-in is portability — AWS uses the AWS VPC CNI to give pods real VPC IPs, Azure has Azure CNI for VNet-native pod IPs versus the simpler NAT'd `kubenet` mode, and on-prem clusters typically use Calico, Cilium, or Flannel to build their own overlay or BGP-based routing — the same Kubernetes core runs unmodified on all of them, only the CNI plugin underneath changes. More advanced plugins like Calico and Cilium also add real security value on top of basic connectivity — actually enforcing Kubernetes NetworkPolicy objects, which not every CNI plugin does, plus features like encrypted pod-to-pod traffic. At CloudCart, we specifically chose Azure CNI over kubenet on AKS so pods would get real, directly addressable VNet IPs — necessary for NSGs and VNet-peered on-prem systems to reach pods properly — accepting the trade-off that it consumes real subnet IPs per pod, which meant sizing the AKS subnet generously up front."*
 
 ---
 
