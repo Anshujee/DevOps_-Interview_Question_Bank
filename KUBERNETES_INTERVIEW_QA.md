@@ -22,6 +22,7 @@
 - [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
   - [Q1. How do you limit resource usage in Kubernetes — not through the Deployment YAML, but through the namespace?](#q1-how-do-you-limit-resource-usage-in-kubernetes--not-through-the-deployment-yaml-but-through-the-namespace)
   - [Q2. What is the purpose of using a CNI (Container Network Interface) in Kubernetes?](#q2-what-is-the-purpose-of-using-a-cni-container-network-interface-in-kubernetes)
+  - [Q3. How do you configure Cluster Autoscaling? Walk through how it's done.](#q3-how-do-you-configure-cluster-autoscaling-walk-through-how-its-done)
 
 ---
 
@@ -3031,6 +3032,140 @@ What separates a basic CNI from an advanced one?
 **Summary (what to say if time is short):**
 
 *"Kubernetes defines a networking model — every pod gets its own unique IP, and any pod can reach any other pod cluster-wide without NAT — but it deliberately doesn't implement that itself. CNI is the pluggable standard interface that does: kubelet calls the configured CNI plugin on every pod creation to allocate an IP, wire up the pod's network interface, and set up routing so it's reachable from other nodes, and calls it again on deletion to clean up. The purpose of making this pluggable rather than built-in is portability — AWS uses the AWS VPC CNI to give pods real VPC IPs, Azure has Azure CNI for VNet-native pod IPs versus the simpler NAT'd `kubenet` mode, and on-prem clusters typically use Calico, Cilium, or Flannel to build their own overlay or BGP-based routing — the same Kubernetes core runs unmodified on all of them, only the CNI plugin underneath changes. More advanced plugins like Calico and Cilium also add real security value on top of basic connectivity — actually enforcing Kubernetes NetworkPolicy objects, which not every CNI plugin does, plus features like encrypted pod-to-pod traffic. At CloudCart, we specifically chose Azure CNI over kubenet on AKS so pods would get real, directly addressable VNet IPs — necessary for NSGs and VNet-peered on-prem systems to reach pods properly — accepting the trade-off that it consumes real subnet IPs per pod, which meant sizing the AKS subnet generously up front."*
+
+---
+
+#### Q3. How do you configure Cluster Autoscaling? Walk through how it's done.
+
+**Answer:**
+
+Worth stating up front, since it's the most common mix-up: **Cluster Autoscaler scales nodes, not pods.** HPA (covered in the Production Kubernetes Guide, §10.1) scales the *number of pods* based on CPU/memory usage — but if there's no node with enough free capacity to actually schedule those new pods, they just sit **Pending** forever. Cluster Autoscaler is what solves that layer: it watches for pods that can't be scheduled due to insufficient resources, and adds nodes; it also watches for nodes that are sitting mostly idle, and removes them. The two autoscalers work at different layers and are almost always deployed together, not as alternatives to each other.
+
+---
+
+**The three autoscalers, and where Cluster Autoscaler fits**
+
+| | Scales what | Trigger | Typical use |
+|---|---|---|---|
+| **HPA** (Horizontal Pod Autoscaler) | Number of pod replicas | Pod-level CPU/memory/custom metric | Handle traffic spikes at the application layer |
+| **VPA** (Vertical Pod Autoscaler) | A pod's own CPU/memory **requests** | Historical usage vs. current requests | Right-size pods that were given too much/too little |
+| **Cluster Autoscaler (CA)** | Number of **nodes** | Pending unschedulable pods (scale up) / sustained low node utilization (scale down) | Make sure the cluster actually has room for what HPA/scheduling need |
+
+---
+
+**How to configure it — step by step**
+
+**Step 1 — Enable autoscaling on the node pool itself, with a min/max bound.** This is the actual "configuration" — CA doesn't invent capacity out of nothing, it just adds/removes nodes within a range you define, on the underlying cloud's node group/node pool/VMSS:
+
+```hcl
+# AKS — Terraform
+resource "azurerm_kubernetes_cluster_node_pool" "application" {
+  enable_auto_scaling = true
+  min_count           = 3
+  max_count           = 10
+}
+```
+
+```hcl
+# EKS — Terraform (managed node group)
+resource "aws_eks_node_group" "application" {
+  scaling_config {
+    min_size     = 3
+    max_size     = 10
+    desired_size = 3
+  }
+}
+```
+Both clouds also expose an equivalent CLI flag (`az aks nodepool update --enable-cluster-autoscaler --min-count 3 --max-count 10`, or `eksctl create nodegroup --asg-access ... --nodes-min 3 --nodes-max 10`) — the Terraform form above is just the version I'd actually run in a real environment, since it's version-controlled and repeatable.
+
+**Step 2 — Deploy/enable the Cluster Autoscaler controller itself.** On AKS, `enable_auto_scaling = true` is enough — Azure runs CA as a managed add-on, nothing extra to deploy. On EKS, Cluster Autoscaler is a **separate workload you deploy into the cluster** (a Deployment running the `cluster-autoscaler` image), which needs its own IAM permissions to actually resize the underlying Auto Scaling Group:
+
+```yaml
+# EKS — IAM permissions the Cluster Autoscaler pod needs, via IRSA
+# (IAM Roles for Service Accounts) — no static credentials on the pod
+Action:
+  - autoscaling:SetDesiredCapacity
+  - autoscaling:TerminateInstanceInAutoScalingGroup
+  - autoscaling:DescribeAutoScalingGroups
+  - ec2:DescribeInstanceTypes
+```
+This is the same "IAM role, never static keys" principle from every AWS question in this file — CA authenticates to the ASG API via IRSA, not a stored access key baked into a Secret.
+
+**Step 3 — Tag the node group so Cluster Autoscaler knows it's allowed to manage it** (EKS specifically requires this — it won't touch an ASG that isn't tagged):
+
+```
+k8s.io/cluster-autoscaler/enabled = true
+k8s.io/cluster-autoscaler/<cluster-name> = owned
+```
+
+**Step 4 — Tune the scale-down behavior** — the defaults are conservative on purpose, but the two flags worth knowing by name:
+- `--scale-down-unneeded-time` (default 10 minutes) — how long a node must stay underutilized before CA considers removing it, to avoid flapping (scale down, then immediately scale back up).
+- `--scale-down-utilization-threshold` (default 0.5) — a node below 50% requested-resource utilization is a scale-down candidate, **provided** every pod on it can be safely rescheduled elsewhere (this is where PodDisruptionBudgets matter — CA won't evict a pod if doing so would violate its PDB).
+
+**Step 5 — For multiple node pools (e.g., general-purpose + GPU + spot), set the `expander` strategy**, which decides *which* pool CA scales up when several could satisfy a pending pod:
+
+| Expander | Behavior |
+|---|---|
+| `random` | Default — picks any eligible pool |
+| `least-waste` | Picks the pool that leaves the least unused capacity after scaling — reduces waste |
+| `priority` | Explicit priority order you define — e.g., prefer spot/cheaper nodes first, fall back to on-demand |
+
+---
+
+**Scale-up and scale-down flow, end to end**
+
+```
+Scale up:
+  Traffic spike → HPA adds pods → new pods PENDING (no node has room)
+    → Cluster Autoscaler notices Pending pods it could schedule if a
+      node were added → adds a node (within max_count) → pods scheduled
+
+Scale down:
+  Traffic drops → HPA removes pods → a node's utilization drops below
+  the threshold → CA waits scale-down-unneeded-time (avoids flapping)
+    → confirms every pod on that node CAN be rescheduled elsewhere
+      without violating a PodDisruptionBudget → cordons + drains the
+      node → terminates it (down to min_count, never below)
+```
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart's AKS application node pool runs with `min_count = 3, max_count = 10`. During a flash-sale traffic spike, HPA scaled `user-service` from 3 to 9 pods within about a minute; the existing 3 nodes couldn't fit that many, so 4 pods sat Pending briefly until Cluster Autoscaler added 2 more nodes, at which point they scheduled and traffic handled normally — this two-layer scale-up (HPA then CA) typically adds 1–2 minutes of node-provisioning latency on top of HPA's near-instant pod scaling, which is a real, worth-mentioning trade-off: CA scale-up isn't instantaneous the way pod scaling is, because it involves actually provisioning a VM.
+
+On the scale-down side, we deliberately set `scale-down-unneeded-time` higher than the 10-minute default, to 20 minutes, after noticing nodes were being removed and then immediately re-added during traffic patterns with regular short lulls — a classic flapping problem that the longer cooldown fixed at the cost of slightly higher idle-node cost during genuinely quiet periods, a trade-off we accepted since node-thrashing was the more disruptive problem of the two.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+First clarify the layer: CA scales NODES, HPA scales PODS — they
+work together, HPA alone can't help if there's no room to schedule
+
+Configuring it:
+  1. enable_auto_scaling + min_count/max_count on the node pool
+     (Terraform, or the cloud's CLI equivalent)
+  2. Deploy the CA controller itself if the cloud doesn't manage it
+     as an add-on (EKS: yes, deploy it, with IRSA IAM permissions;
+     AKS: no, it's a managed add-on already)
+  3. Tag the underlying node group/ASG so CA is permitted to manage it
+  4. Tune scale-down-unneeded-time / scale-down-utilization-threshold
+     to avoid flapping — respects PodDisruptionBudgets before evicting
+  5. Multiple node pools → set an expander strategy (least-waste or
+     priority, not just random) to control WHICH pool gets scaled
+
+Worth mentioning as a real trade-off: node scale-up is slower than
+pod scale-up, since it means actually provisioning a VM — a couple
+minutes of Pending pods during a spike is expected, not a bug
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Cluster Autoscaler scales nodes, not pods — HPA handles pods based on CPU or memory, but if there's no node with room, those new pods just stay Pending, and that's exactly the gap Cluster Autoscaler fills. To configure it, I'd enable autoscaling on the node pool itself with a min and max count — that's a Terraform flag on both AKS and EKS. On AKS it's a managed add-on with nothing else to deploy; on EKS, Cluster Autoscaler runs as its own workload in the cluster and needs IAM permissions via IRSA to resize the underlying Auto Scaling Group, plus specific tags on that ASG so it knows it's allowed to manage it. From there, I'd tune the scale-down behavior — how long a node has to sit underutilized before it's removed, and the utilization threshold that makes it eligible — since the defaults are deliberately conservative to avoid flapping, where a node gets removed and then immediately re-added. And it always respects PodDisruptionBudgets before evicting anything during a scale-down. If there are multiple node pools — say general-purpose plus spot instances — I'd also set an expander strategy like least-waste or an explicit priority order, rather than leaving it to pick randomly. One real trade-off worth calling out: node scale-up is noticeably slower than pod scale-up, since it means actually provisioning a VM, so a minute or two of Pending pods during a sudden spike is expected behavior, not something broken."*
 
 ---
 
