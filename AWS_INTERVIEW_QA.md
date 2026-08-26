@@ -16,10 +16,6 @@
   - [Q6. If secrets are created in AWS Secrets Manager, how can Amazon EKS access those secrets?](#q6-if-secrets-are-created-in-aws-secrets-manager-how-can-amazon-eks-access-those-secrets)
   - [Q7. How do you set up RBAC in Amazon EKS?](#q7-how-do-you-set-up-rbac-in-amazon-eks)
 - [Interview #2 — Coforge | DevOps Engineer | Technical Round 1](#interview-2)
-- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
-  - [Q1. Sending log files from EC2 to S3 — what are the steps?](#q1-sending-log-files-from-ec2-to-s3--what-are-the-steps)
-  - [Q2. You have an S3 bucket in one region — is it possible to access it from a different region?](#q2-you-have-an-s3-bucket-in-one-region--is-it-possible-to-access-it-from-a-different-region)
-  - [Q3. Is it possible to create a NAT Gateway in a private subnet?](#q3-is-it-possible-to-create-a-nat-gateway-in-a-private-subnet)
   - [Q1. On what basis do you decide the CIDR of a VPC? (Scenario: Suppose I ask you to create a VPC — how would you decide its CIDR range?)](#q1-on-what-basis-do-you-decide-the-cidr-of-a-vpc-scenario-suppose-i-ask-you-to-create-a-vpc--how-would-you-decide-its-cidr-range)
   - [Q2. VPC design for multiple services (RDS, Redshift, etc.) — one subnet per service, and how do you account for 20% growth?](#q2-vpc-design-for-multiple-services-rds-redshift-etc--one-subnet-per-service-and-how-do-you-account-for-20-growth)
   - [Q3. If I have 100 IP addresses and want 20% growth, how would you determine the required network range?](#q3-if-i-have-100-ip-addresses-and-want-20-growth-how-would-you-determine-the-required-network-range)
@@ -34,6 +30,10 @@
   - [Q12. Explain a production issue you have faced](#q12-explain-a-production-issue-you-have-faced)
   - [Q13. An application is hosted on a public EC2 instance — how do you migrate it to a private subnet following AWS best practices (security, networking, HA)?](#q13-an-application-is-hosted-on-a-public-ec2-instance--how-do-you-migrate-it-to-a-private-subnet-following-aws-best-practices-security-networking-ha)
   - [Q14. How do you provide HTTPS access to an application hosted in a private subnet?](#q14-how-do-you-provide-https-access-to-an-application-hosted-in-a-private-subnet)
+- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
+  - [Q1. Sending log files from EC2 to S3 — what are the steps?](#q1-sending-log-files-from-ec2-to-s3--what-are-the-steps)
+  - [Q2. You have an S3 bucket in one region — is it possible to access it from a different region?](#q2-you-have-an-s3-bucket-in-one-region--is-it-possible-to-access-it-from-a-different-region)
+  - [Q3. Is it possible to create a NAT Gateway in a private subnet?](#q3-is-it-possible-to-create-a-nat-gateway-in-a-private-subnet)
 
 ---
 

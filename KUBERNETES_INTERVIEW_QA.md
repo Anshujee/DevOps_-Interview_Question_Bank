@@ -16,11 +16,11 @@
   - [Scenario 1. ImagePullBackOff — Possible Reasons?](#scenario-1-imagepullbackoff----possible-reasons)
   - [Scenario 2. Same image works for another app — only my app gets ImagePullBackOff](#scenario-2-advanced-same-image-same-tag-same-registry-works-for-another-app-only-your-application-gets-imagepullbackoff-what-could-be-the-reason)
 - [Interview #2 — Coforge | DevOps Engineer | Technical Round 1](#interview-2)
-- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
-  - [Q1. How do you limit resource usage in Kubernetes — not through the Deployment YAML, but through the namespace?](#q1-how-do-you-limit-resource-usage-in-kubernetes--not-through-the-deployment-yaml-but-through-the-namespace)
   - [Q1. How does endpoint (API server) authentication work in Kubernetes?](#q1-how-does-endpoint-api-server-authentication-work-in-kubernetes)
   - [Q2. How did you troubleshoot a pod CrashLoopBackOff?](#q2-how-did-you-troubleshoot-a-pod-crashloopbackoff)
   - [Q3. Explain Kubernetes architecture and components and their uses](#q3-explain-kubernetes-architecture-and-components-and-their-uses)
+- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
+  - [Q1. How do you limit resource usage in Kubernetes — not through the Deployment YAML, but through the namespace?](#q1-how-do-you-limit-resource-usage-in-kubernetes--not-through-the-deployment-yaml-but-through-the-namespace)
 
 ---
 

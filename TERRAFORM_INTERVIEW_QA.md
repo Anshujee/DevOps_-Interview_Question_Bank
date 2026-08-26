@@ -31,12 +31,12 @@
   - [Scenario 5. Customer wants Read-Only access to an existing Resource Group](#scenario-5-you-have-an-existing-terraform-managed-azure-environment-a-customer-wants-read-only-access-to-an-existing-resource-group-how-would-you-implement-this)
   - [Scenario 6. Terraform Plan detects Drift — Customer confirms valid vs not valid](#scenario-6-suppose-terraform-plan-detects-drift-how-would-you-proceed-and-customer-confirms-the-drift-is-valid-how-would-you-proceed-what-if-the-customer-says-the-drift-is-not-valid)
 - [Interview #2 — Accenture | DevOps Engineer | Technical Round 1](#interview-2)
+  - [Q1. What happens when we run terraform init?](#q1-what-happens-when-we-run-terraform-init)
+  - [Q2. Write a Terraform script to create an EC2 instance in multiple regions](#q2-write-a-terraform-script-to-create-an-ec2-instance-in-multiple-regions)
 - [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
   - [Q1. Define an Azure Virtual Network (VNet) with a given IP range](#q1-define-an-azure-virtual-network-vnet-with-a-given-ip-range)
   - [Q2. Set up an Azure Bastion Host for secure access to the VMs](#q2-set-up-an-azure-bastion-host-for-secure-access-to-the-vms)
   - [Q3. Configure an Azure Load Balancer to route traffic to the application VMs](#q3-configure-an-azure-load-balancer-to-route-traffic-to-the-application-vms)
-  - [Q1. What happens when we run terraform init?](#q1-what-happens-when-we-run-terraform-init)
-  - [Q2. Write a Terraform script to create an EC2 instance in multiple regions](#q2-write-a-terraform-script-to-create-an-ec2-instance-in-multiple-regions)
 
 ---
 
