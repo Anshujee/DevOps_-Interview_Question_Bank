@@ -14,6 +14,7 @@
   - [Q4. A developer has written only source code — design the CI/CD pipeline to deploy it to DEV/QA/PROD using best practices](#q4-a-developer-has-written-only-source-code--design-the-cicd-pipeline-to-deploy-it-to-devqaprod-using-best-practices)
 - [Interview #2 — Wipro | DevOps Engineer | Technical Round 1](#interview-2)
   - [Q1. Explain Three-Tier Architecture in detail](#q1-explain-three-tier-architecture-in-detail)
+  - [Q2. What are the various stages of a CI/CD pipeline? (+ Follow-up: How will you build the image during CI, and how will you manage it?)](#q2-what-are-the-various-stages-of-a-cicd-pipeline--follow-up-how-will-you-build-the-image-during-ci-and-how-will-you-manage-it)
 
 ---
 
@@ -463,6 +464,90 @@ Where it sits among alternatives:
 **Summary (what to say if time is short):**
 
 *"Three-tier architecture splits an application into three layers with one responsibility each: Presentation, which renders the UI and handles user input with no business logic of its own; Application, which holds the actual business logic, validation, and orchestration; and Data, which only stores and retrieves data. The rule that makes the whole pattern work is that each tier only talks to the tier immediately next to it — Presentation never talks directly to Data, it always goes through Application. That separation is what enables independently scaling each tier, using the best-fit technology per tier, tightly restricting the Data tier's network access to just the Application tier, and keeping a UI change from ever requiring a change to business logic or the database schema. I'd contrast it briefly with 2-tier, client-server architecture — where the client talks straight to the database with no logic layer in between — which is exactly the tightly-coupled anti-pattern three-tier architecture exists to prevent, and I've seen that exact violation happen in practice: a reporting feature that queried the database directly instead of going through the application layer, which both created a security gap and broke unexpectedly when the schema later changed."*
+
+---
+
+#### Q2. What are the various stages of a CI/CD pipeline? (+ Follow-up: How will you build the image during CI, and how will you manage it?)
+
+**Answer:**
+
+I'd walk through this as one continuous pipeline, split into the CI half (everything up to producing a trustworthy, deployable artifact) and the CD half (everything that gets that artifact safely into an environment) — because the follow-up about image building sits right at the boundary between the two.
+
+---
+
+**The stages, in order**
+
+```
+1. Source        → commit / PR opens, triggers the pipeline
+2. Build         → compile / install dependencies / transpile
+3. Test          → unit tests, static analysis (lint, SAST), dependency/vulnerability scan
+4. Package        → build the container image, tag it, scan it, push to a registry
+5. Deploy         → promote that SAME image to DEV → QA/Staging → PROD
+6. Verify/Monitor → smoke tests, health checks, bake period, alerting, rollback path
+```
+
+| Stage | What happens | What it catches |
+|---|---|---|
+| **1. Source** | A commit or PR triggers the pipeline; branch protection requires the pipeline to pass before merge | Nothing yet — this is the trigger |
+| **2. Build** | Install dependencies, compile/transpile the application code | Compilation errors, missing dependencies |
+| **3. Test** | Unit tests, linting, SAST (static application security testing), dependency/CVE scanning — all run against source, before anything is packaged | Logic bugs, code-quality issues, known-vulnerable dependencies — cheap to catch here, expensive to catch in PROD |
+| **4. Package** | Build the container image from the already-tested code, tag it immutably, scan the built image itself, push to a registry | Image-level vulnerabilities (base image CVEs, layers), and this is where the deployable artifact is actually created |
+| **5. Deploy** | The **same** image, identified by tag, is promoted through DEV → QA/Staging → PROD, never rebuilt per environment | Environment-specific config/integration issues, without ever risking "different bits than what was tested" |
+| **6. Verify/Monitor** | Automated smoke tests right after deploy, then a monitored bake period watching key metrics; a known rollback path (redeploy the previous good tag) | Bad deploys that pass all pre-deploy checks but misbehave under real traffic |
+
+Stages 1–4 are **CI** — the output is one trustworthy, versioned artifact. Stages 5–6 are **CD** — getting that exact artifact into environments safely. The follow-up question lands squarely in stage 4.
+
+---
+
+**Follow-up — how do you build the image during CI, and how do you manage it?**
+
+**Building it:**
+- The image is built **once**, right after the code passes stages 2–3 (build + test) — never before tests pass, so a broken image never even gets created.
+- I use a **multi-stage Dockerfile** — a build stage with the full toolchain (compiler, dev dependencies) and a slim final stage that copies over only the compiled output/runtime dependencies, so the image that actually ships is small and doesn't carry build tooling as an attack surface.
+- On a Kubernetes-based CI runner, I avoid Docker-in-Docker (it needs a privileged container, which is a real security smell) and build with a **daemonless builder** instead — Kaniko, Buildah, or BuildKit — so the build itself doesn't need privileged access to the host's Docker daemon.
+- **Layer caching** is deliberately ordered — dependency manifests (`package.json`, `requirements.txt`, `pom.xml`) are copied and installed *before* the application source, so a source-only change doesn't invalidate the (slow) dependency-install layer.
+
+**Tagging — the part that matters most for traceability:**
+- Every image is tagged with the **git commit SHA**, never `latest` or a mutable tag, for anything that gets deployed. That's what makes "what code is actually running in PROD right now" an answerable question with certainty, not a guess.
+- `latest` is fine for local dev convenience, never for a deployed environment.
+
+**Managing it (registry side):**
+- Pushed to a **private registry** (ECR/ACR/GCR/Harbor) — never a public registry for anything with proprietary code baked in.
+- **Scanned on push** (Trivy, ECR's built-in scanning, or similar) — the pipeline fails the build if a critical/high CVE shows up in the image, not after it's already deployed.
+- **Immutable tags** — once a tag is pushed, the registry is configured to reject overwriting it, so a tag can never silently start pointing at different bits later.
+- **Lifecycle/retention policy** — old, unpromoted images (feature-branch builds, anything past N days without being deployed anywhere) get automatically expired, so the registry doesn't grow unbounded and cost/clutter creep up.
+- **Access control** — pulling from the registry is scoped via IAM (e.g., only the cluster's node role can pull), not open credentials shared across the team.
+- The **same pushed image** is what gets promoted through DEV → QA → PROD in the deploy stages — the registry is the single source of truth for "this exact artifact," never rebuilt per environment.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart's pipeline builds the image in the "Package" stage using a GitHub Actions runner with `docker buildx`, immediately after unit tests and SAST pass on the PR-merged commit. The image is tagged with the 7-character git SHA (e.g., `user-service:a3f9c21`), scanned with Trivy as a required step — a critical CVE in a base image once blocked a release for about two hours until we bumped to a patched base image, which is exactly the scanning step doing its job — and pushed to ECR. ECR's lifecycle policy expires any untagged or unpromoted image after 14 days, which keeps registry storage costs predictable. The same SHA-tagged image is then referenced by DEV, QA, and PROD's Kubernetes manifests in turn — only the manifest's image tag changes as it's promoted, the bits inside never do.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Six stages, CI then CD:
+  Source → Build → Test → Package → Deploy → Verify/Monitor
+  \_______CI (produce one trustworthy artifact)______/  \___CD___/
+
+Follow-up is really about stage 4 (Package):
+  Build:  multi-stage Dockerfile, daemonless builder (Kaniko/BuildKit)
+          on k8s runners, dependency layers cached before source
+  Tag:    git commit SHA, never `latest`, for anything deployed
+  Manage: private registry, scan-on-push (fail on critical CVEs),
+          immutable tags, retention/lifecycle policy, IAM-scoped pull
+          access, same image promoted everywhere — never rebuilt
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"A CI/CD pipeline has six stages: Source triggers it, Build compiles the code, Test runs unit tests/lint/SAST/dependency scanning, Package builds and tags the container image and scans it, Deploy promotes that same image through DEV, QA, and PROD, and Verify/Monitor runs smoke tests and watches a bake period with a rollback path ready. The first four are CI — they produce one trustworthy artifact — and the last two are CD, getting that exact artifact out safely. For the image specifically: I build it once, after tests pass, using a multi-stage Dockerfile for a small final image, with a daemonless builder like Kaniko or BuildKit if the CI runner is on Kubernetes, so I'm not relying on a privileged Docker-in-Docker setup. I tag it with the git commit SHA, never `latest`, push it to a private registry with scan-on-push and immutable tags, and set a retention policy so old builds expire automatically. That same tagged image is what gets promoted through every environment — it's never rebuilt per environment, which is what actually guarantees what was tested is what ships."*
 
 ---
 
