@@ -15,6 +15,7 @@
 - [Interview #2 — Wipro | DevOps Engineer | Technical Round 1](#interview-2)
   - [Q1. Explain Three-Tier Architecture in detail](#q1-explain-three-tier-architecture-in-detail)
   - [Q2. What are the various stages of a CI/CD pipeline? (+ Follow-up: How will you build the image during CI, and how will you manage it?)](#q2-what-are-the-various-stages-of-a-cicd-pipeline--follow-up-how-will-you-build-the-image-during-ci-and-how-will-you-manage-it)
+  - [Q3. You said you have worked on automation. What kind of automation have you done? Can you elaborate?](#q3-you-said-you-have-worked-on-automation-what-kind-of-automation-have-you-done-can-you-elaborate)
 
 ---
 
@@ -548,6 +549,83 @@ Follow-up is really about stage 4 (Package):
 **Summary (what to say if time is short):**
 
 *"A CI/CD pipeline has six stages: Source triggers it, Build compiles the code, Test runs unit tests/lint/SAST/dependency scanning, Package builds and tags the container image and scans it, Deploy promotes that same image through DEV, QA, and PROD, and Verify/Monitor runs smoke tests and watches a bake period with a rollback path ready. The first four are CI — they produce one trustworthy artifact — and the last two are CD, getting that exact artifact out safely. For the image specifically: I build it once, after tests pass, using a multi-stage Dockerfile for a small final image, with a daemonless builder like Kaniko or BuildKit if the CI runner is on Kubernetes, so I'm not relying on a privileged Docker-in-Docker setup. I tag it with the git commit SHA, never `latest`, push it to a private registry with scan-on-push and immutable tags, and set a retention policy so old builds expire automatically. That same tagged image is what gets promoted through every environment — it's never rebuilt per environment, which is what actually guarantees what was tested is what ships."*
+
+---
+
+#### Q3. You said you have worked on automation. What kind of automation have you done? Can you elaborate?
+
+**Answer:**
+
+"Automation" on its own is too broad to answer well in one sentence, so I'd break it into the **distinct categories** I've actually worked across, rather than giving one vague example — it also lets me show breadth instead of depth-in-one-spot. Broadly, my automation work falls into five buckets: **CI/CD pipeline automation, infrastructure automation, operational/self-healing automation, routine scripting automation, and security automation** — each solving a different class of "a human doing this by hand doesn't scale/is error-prone."
+
+---
+
+**The five categories, with what each one replaces**
+
+| Category | What it automates | Manual alternative it replaces |
+|---|---|---|
+| **CI/CD pipeline automation** | Build, test, package, and deploy on every commit | A person manually building, testing, and SSH-ing in to deploy each release |
+| **Infrastructure automation (IaC)** | Provisioning and changing cloud infrastructure | Clicking through the AWS/Azure console per environment, undocumented and unrepeatable |
+| **Operational/self-healing automation** | Scaling and recovering from failure automatically | Someone getting paged to manually add capacity or restart a crashed service |
+| **Routine scripting automation** | Repetitive, scheduled operational tasks | A person running the same script/checklist by hand on a schedule |
+| **Security automation** | Vulnerability/dependency scanning as a required pipeline gate | A separate, manual, periodic security review after code is already shipped |
+
+---
+
+**1. CI/CD pipeline automation**
+
+The design covered in Q4 (Interview #1) and Q2 above — a pipeline that builds an image once, tags it with the git commit SHA, and automatically promotes that same artifact through DEV → QA → PROD, with required checks (lint, SAST, dependency scanning, unit tests) gating the merge, and a manual approval gate only in front of PROD. This is the automation I'd point to first, because it's the one that most directly removed a slow, error-prone manual process — before it existed, deploys were a person following a checklist and running commands by hand, which is exactly the kind of "toil" SRE practice (Q1) explicitly tries to eliminate.
+
+**2. Infrastructure automation (IaC)**
+
+Everything CloudCart's infrastructure needs — VPCs, AKS/EKS clusters, node pools, RDS, IAM roles — is provisioned through Terraform, never the cloud console, following the same PR-review → `terraform plan` → approval → `terraform apply` promotion philosophy as the app pipeline (Terraform interview, Q11/Q14). This is automation in the sense that infrastructure changes are no longer "someone remembers the exact console steps" — they're a reviewable diff that runs the same way every time, in every environment.
+
+**3. Operational/self-healing automation**
+
+This is the category with the most concrete, specific examples:
+- **Cluster Autoscaler** (Kubernetes interview, Q3) — nodes get added automatically when pods can't be scheduled, and removed automatically once they're underutilized, with no one manually resizing a node pool.
+- **HPA** — pods scale out and back in automatically based on CPU/memory, handling traffic spikes without a human watching a dashboard and scaling a Deployment by hand.
+- **CloudWatch Alarm → SNS automation** (AWS interview, Q4) — CPU crossing a threshold for a sustained period automatically notifies the on-call team via SNS/Slack/PagerDuty, instead of an outage being discovered only when a customer complains.
+- **Kubernetes liveness/readiness probes** — a crashed container gets restarted automatically by the kubelet, without anyone needing to notice and intervene.
+
+**4. Routine scripting automation**
+
+Smaller, but the category most people underestimate — a Python script that watches a directory and reports newly arrived files every minute (Python interview, Q4), a Lambda function reading files from S3 on a trigger (Python interview, Q2), a `logrotate`-hooked `aws s3 sync` job archiving logs to S3 on a schedule (AWS interview, Q1) — none of these are glamorous, but they're the exact kind of repetitive operational work that, left manual, either doesn't happen consistently or eats an engineer's time that should go elsewhere.
+
+**5. Security automation**
+
+Dependency vulnerability scanning and SAST run as **required PR checks**, not a separate, periodic manual review — and container images are scanned on push to the registry (Trivy/ECR scanning), failing the build on a critical/high CVE rather than letting a known-vulnerable image reach PROD and get caught later, if ever.
+
+---
+
+**Real-world example — CloudCart, tying it together end to end**
+
+The clearest single story that spans several of these categories at once: CloudCart's order-processing service used to be deployed by a person manually running `docker build`, pushing to ECR, and SSH-ing into instances to pull the new image — no IaC, no pipeline, no autoscaling. Over time, that got replaced, category by category: the deploy process became the CI/CD pipeline from Q2; the infrastructure it ran on became Terraform-managed; the fleet gained an HPA and Cluster Autoscaler so it no longer needed manual capacity planning during traffic spikes; and a CloudWatch Alarm + SNS pipeline meant the team found out about CPU pressure from an automated page, not from a customer-facing outage. None of these were built in one project — each one replaced a specific, previously-manual pain point as it became the next bottleneck, which is honestly the more realistic story than "we automated everything at once."
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Don't answer "automation" with one example — show the categories:
+
+1. CI/CD pipeline        → build once, promote everywhere, gated checks
+2. Infrastructure (IaC)  → Terraform, reviewable + repeatable, no console clicking
+3. Operational/self-healing → HPA, Cluster Autoscaler, liveness probes,
+                              CloudWatch alarms → automatic notification
+4. Routine scripting     → scheduled/triggered scripts for repetitive ops tasks
+5. Security              → scanning as a required gate, not a manual after-the-fact review
+
+Then anchor with ONE concrete, connected story (not five disconnected
+one-liners) showing how a single real service moved from fully manual
+to automated across several of these categories over time
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"I'd split it into a few distinct categories rather than one example, because 'automation' covers genuinely different problems. CI/CD pipeline automation — building an artifact once and automatically promoting it through environments with gated checks. Infrastructure automation — everything provisioned through Terraform instead of the console, so changes are reviewable and repeatable. Operational automation — Cluster Autoscaler and HPA handling scaling without anyone manually resizing anything, liveness probes restarting crashed containers automatically, and CloudWatch alarms paging the team through SNS before a customer notices an issue. Routine scripting — smaller things like scheduled log archival jobs or a script watching a directory for new files, which aren't glamorous but save real recurring manual effort. And security automation — vulnerability and dependency scanning running as a required pipeline gate rather than a separate manual review after the fact. The concrete story I'd point to is CloudCart's order-processing service, which used to be deployed by someone manually running docker build and SSH-ing in — over time that got replaced piece by piece: the deploy became a real CI/CD pipeline, the infrastructure became Terraform-managed, the fleet gained autoscaling, and CPU issues started surfacing as an automated alert instead of a customer complaint."*
 
 ---
 
