@@ -17,6 +17,7 @@
   - [Q2. What are the various stages of a CI/CD pipeline? (+ Follow-up: How will you build the image during CI, and how will you manage it?)](#q2-what-are-the-various-stages-of-a-cicd-pipeline--follow-up-how-will-you-build-the-image-during-ci-and-how-will-you-manage-it)
   - [Q3. You said you have worked on automation. What kind of automation have you done? Can you elaborate?](#q3-you-said-you-have-worked-on-automation-what-kind-of-automation-have-you-done-can-you-elaborate)
   - [Q4. Can you explain a real-time example of automation you have implemented? What is the most common automation implemented by a DevOps engineer?](#q4-can-you-explain-a-real-time-example-of-automation-you-have-implemented-what-is-the-most-common-automation-implemented-by-a-devops-engineer)
+  - [Q5. Have you implemented Prometheus/Grafana in your current or recent project?](#q5-have-you-implemented-prometheusgrafana-in-your-current-or-recent-project)
 
 ---
 
@@ -738,6 +739,111 @@ Two-part answer:
 **Summary (what to say if time is short):**
 
 *"I'll give one specific example rather than another broad list. CloudCart's order-processing service occasionally had pods that were alive — passing liveness probes — but stuck, not actually draining their queue, a failure mode Kubernetes' own self-healing couldn't catch since nothing was technically failing. I built a closed-loop automation: a CloudWatch Alarm on queue message age triggers a Lambda that first confirms the pods are otherwise healthy — so it doesn't collide with HPA or Cluster Autoscaler if the real cause is a capacity problem instead — and if confirmed, does a rolling restart automatically, posting an info-level note rather than paging anyone, and only escalates to a real page if the restart doesn't fix it within 10 minutes. That took this specific failure mode from a 15-to-20-minute manual page-and-restart down to under 2 minutes, resolved automatically. As for what's most common industry-wide, though — I'd be honest that it's more table-stakes than that: CI/CD pipelines, Infrastructure as Code, horizontal autoscaling, automated backups, and monitoring/alerting are close to universal on any real DevOps team. Closed-loop auto-remediation like my example is common as a concept, but the actual implementations tend to be bespoke per failure mode rather than an off-the-shelf standard practice — which is why I gave a specific example instead of claiming it's something every team already has."*
+
+---
+
+#### Q5. Have you implemented Prometheus/Grafana in your current or recent project?
+
+**Answer:**
+
+Yes — and I'd frame it clearly as **Kubernetes/application-level observability**, running alongside, not instead of, the AWS-native CloudWatch stack discussed elsewhere in this interview (AWS Q4). They cover genuinely different scopes: CloudWatch is what AWS resources report natively (EC2 CPU, ELB metrics, SQS queue depth); Prometheus/Grafana is what gives deep, flexible, **application- and pod-level** metrics inside the Kubernetes cluster itself, queryable in ways CloudWatch's fixed metric model doesn't really support.
+
+---
+
+**What each half of the stack actually does**
+
+- **Prometheus** — a pull-based metrics system: it periodically **scrapes** a `/metrics` HTTP endpoint that each target (an application, or an exporter sitting in front of something that doesn't natively expose metrics) exposes, and stores everything as time-series data. It comes with its own query language, **PromQL**, for slicing that data — rates, percentiles, aggregations across labels.
+- **Grafana** — the visualization layer on top. It doesn't collect metrics itself; it queries Prometheus (and can query other data sources too — CloudWatch, Loki for logs) and renders dashboards from those PromQL queries.
+- **Alertmanager** — the piece that actually turns a Prometheus alerting rule into a real notification (email, Slack, PagerDuty), including grouping/deduplicating related alerts and handling silences — Prometheus itself only evaluates alert *rules* and fires them into Alertmanager, it doesn't send notifications on its own.
+
+---
+
+**How it's actually deployed on Kubernetes**
+
+Rather than hand-rolling each piece, the standard approach is the **kube-prometheus-stack** Helm chart (built on the **Prometheus Operator**), which installs Prometheus, Alertmanager, Grafana, and the supporting pieces together, and — critically — introduces Kubernetes CRDs that make target discovery declarative instead of manually maintained:
+
+```yaml
+# A ServiceMonitor — tells Prometheus Operator to automatically
+# discover and scrape this service's /metrics endpoint, no manual
+# scrape_config editing required
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order-service-monitor
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  endpoints:
+    - port: metrics
+      interval: 30s
+```
+This is the detail that separates "I've seen a Grafana dashboard" from actually having deployed the stack — without the Operator's CRDs, adding a new service to be monitored means manually editing Prometheus's `scrape_configs` and reloading it; with `ServiceMonitor`, a new service just needs the right label and Prometheus discovers it automatically.
+
+**The two exporters that come up constantly for cluster-wide visibility** (also referenced in the AWS interview's agents question, Q9): **`kube-state-metrics`** (Kubernetes object state — pod status, deployment replica counts, not application-level data) and **`node-exporter`** (host-level OS metrics — CPU, memory, disk, network from the node itself, running as a DaemonSet).
+
+---
+
+**What actually gets built on top — dashboards and alerts**
+
+- **Dashboards**: request rate, error rate, and latency per service (the **RED method** — Rate, Errors, Duration), plus resource-level dashboards (CPU/memory per pod, node utilization) using `node-exporter`/`kube-state-metrics` data.
+- **Alert rules**, evaluated by Prometheus and routed through Alertmanager — the same category of alerting as the PRODUCTION_KUBERNETES_GUIDE.md's monitoring section, expressed as PromQL instead of a CloudWatch metric math expression:
+
+```yaml
+# Alert when a pod restarts more than 3 times in 15 minutes
+- alert: PodFrequentlyRestarting
+  expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Pod {{ $labels.pod }} is restarting frequently"
+```
+
+---
+
+**A real limitation worth mentioning without being asked — retention and HA**
+
+Prometheus's default local storage is genuinely **not** meant for long-term retention or high availability out of the box — it's a single-node time-series database on local disk, fine for a couple weeks of data, not for "query trends from 18 months ago" or surviving that one pod being lost. For real production use, that means either `remote_write`-ing metrics to long-term storage (Thanos, Cortex, or Mimir add horizontal scaling and long-term object-storage-backed retention on top of vanilla Prometheus), or using a cloud-managed Prometheus-compatible service (Amazon Managed Service for Prometheus, Azure Monitor managed Prometheus) instead of self-hosting the storage layer at all. I'd flag this proactively in an interview, because "yes I've used Prometheus" without knowing about this limitation is a shallower answer than one that acknowledges it.
+
+---
+
+**Real-world example — CloudCart**
+
+CloudCart runs `kube-prometheus-stack` on its EKS/AKS clusters specifically for pod- and application-level visibility that CloudWatch doesn't give cleanly — PromQL dashboards showing per-service request latency percentiles and error rates that feed directly into the SLO tracking described in the DevOps interview (Q2, Interview #1), since CloudWatch's metric model makes that kind of ad-hoc percentile querying across custom application labels considerably more awkward. CloudWatch remains the tool of record for AWS infrastructure-level alarms (the CPU/SNS automation from AWS Q4) and anything that needs to trigger AWS-native actions like Lambda; Prometheus/Grafana is the tool for everything happening *inside* the cluster at the pod and application level. Early on, CloudCart ran vanilla self-hosted Prometheus with default local retention and hit exactly the limitation above — losing several weeks of dashboard history after a storage volume issue — which is what prompted moving to `remote_write` into a managed, long-term-retention backend instead of treating Prometheus's own local disk as durable history.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Frame it as a distinct layer from CloudWatch, not a replacement:
+  CloudWatch    → AWS-native resource metrics/alarms
+  Prometheus/   → deep, flexible, pod/application-level metrics
+  Grafana         INSIDE the cluster, queried via PromQL
+
+What each piece does:
+  Prometheus    → pulls/scrapes /metrics endpoints, stores time-series,
+                  evaluates alert RULES (doesn't notify by itself)
+  Alertmanager  → turns a fired rule into an actual notification,
+                  handles grouping/dedup/silences
+  Grafana       → visualization layer, queries Prometheus (+ others)
+
+How it's actually deployed: kube-prometheus-stack + Prometheus
+Operator, with ServiceMonitor CRDs for declarative target discovery
+— NOT manually edited scrape_configs
+
+Volunteer the real limitation unprompted: local Prometheus storage
+isn't durable/long-term by default — remote_write to Thanos/Cortex/
+Mimir or a managed service is the real production answer
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Yes — I'd frame it as a separate observability layer from CloudWatch rather than a replacement for it. CloudWatch covers AWS-native resource metrics and alarms; Prometheus and Grafana cover deep, pod- and application-level metrics inside the Kubernetes cluster, queried with PromQL, which gives a lot more flexibility than CloudWatch's fixed metric model for things like per-service latency percentiles. In practice, I've deployed it as the kube-prometheus-stack Helm chart, which brings in the Prometheus Operator, and specifically uses ServiceMonitor custom resources so a new service just needs the right label to get automatically discovered and scraped, instead of manually editing scrape configs every time something new needs monitoring. On top of that, dashboards typically follow the RED method — rate, errors, duration — per service, plus node and pod-level resource dashboards using node-exporter and kube-state-metrics. One thing I'd flag without being asked: Prometheus's default local storage isn't meant for long-term retention or high availability by itself, so a real production setup needs either remote_write into something like Thanos or Cortex, or a managed Prometheus-compatible service — I've actually seen the consequence of not doing that, losing several weeks of dashboard history after a storage issue on a self-hosted setup, which is exactly what pushed us to a managed, long-term-retention backend instead."*
 
 ---
 
