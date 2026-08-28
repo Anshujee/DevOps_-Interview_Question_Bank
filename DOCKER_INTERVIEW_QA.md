@@ -17,6 +17,9 @@
   - [Scenario 2. Containers running, network fine, config correct — still Connection Refused](#scenario-2-interviewer-removed-all-obvious-causes----containers-running-network-fine-configuration-correct----still-getting-connection-refused-what-will-you-check-now)
 - [Interview #2 — Coforge | DevOps Engineer | Technical Round 1](#interview-2)
   - [Q1. What's the difference between Docker and Kubernetes?](#q1-whats-the-difference-between-docker-and-kubernetes)
+- [Interview #3 — Wipro | DevOps Engineer | Technical Round 1](#interview-3)
+  - [Q1. Have you containerized Java-based or Python applications?](#q1-have-you-containerized-java-based-or-python-applications)
+  - [Q2. What is the difference between CMD and ENTRYPOINT in Docker?](#q2-what-is-the-difference-between-cmd-and-entrypoint-in-docker)
 
 ---
 
@@ -2318,10 +2321,262 @@ Does Kubernetes actually use Docker to run containers?
 
 ---
 
+## Interview #3
+
+**Company:** Wipro
+**Date:** 23-08-2026
+**Role Applied For:** DevOps Engineer
+**Round:** Technical Round 1
+**Interviewer Level:** Not specified
+
+---
+
+### Questions Asked
+
+#### Q1. Have you containerized Java-based or Python applications?
+
+**Answer:**
+
+Yes, both — and I'd deliberately walk through them separately, because they have genuinely different containerization concerns beyond just "write a Dockerfile." Java's problem is mostly about the **JDK/JRE size gap and JVM memory behavior inside a container**; Python's problem is mostly about **base image choice and C-extension build dependencies**. Both end up using multi-stage builds (Q5, Interview #1), but for different reasons.
+
+---
+
+**Java — the AzureShop `order-service` example (Q5, Interview #1)**
+
+The multi-stage pattern already covered there — build with the full JDK, ship with only the JRE — is the size half of the story. The part worth adding here, and a genuinely important detail for a containerized JVM specifically, is **how the JVM sizes its heap relative to the container's memory limit**:
+
+```dockerfile
+# What Q5 showed — a fixed heap size
+ENV JAVA_OPTS="-Xmx512m -Xms256m"
+```
+
+This works, but it's a **static** number that has to be manually kept in sync with whatever memory limit the container/pod is actually given — if the Kubernetes Deployment's memory limit changes, someone has to remember to update `-Xmx` too, or the JVM either wastes available memory or, worse, gets OOMKilled by the container runtime before the JVM itself would have hit its own heap limit. Modern JVMs (Java 10+, and reliably so from Java 11 onward) are **container-aware** — they can read the cgroup memory limit directly and size the heap as a *percentage* of it instead of a fixed number:
+
+```dockerfile
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+```
+
+That's the detail I'd volunteer without being asked — it's the difference between "I copied a Dockerfile that works" and actually understanding a real, historically painful Java-in-containers problem (pre-container-aware JVMs used to see the **host's** total memory, not the container's limit, and would size a default heap far too large for the container it was actually confined to, leading to mysterious OOMKills that had nothing to do with an actual memory leak).
+
+**Other Java-specific choices worth mentioning:** `eclipse-temurin` (or another actively-maintained OpenJDK distribution) over old, no-longer-updated base images; for services where the JAR itself is small and image size matters even more, `jlink` can build a custom, minimal JRE containing only the modules the application actually uses, going a step further than just switching from `-jdk` to `-jre`.
+
+---
+
+**Python — base image and native-dependency concerns**
+
+Python's containerization story has a different central gotcha: **`alpine` is usually the wrong choice**, despite being the smallest option, and I'd say so explicitly since it's a common early mistake. Alpine uses `musl` libc instead of `glibc`, and many popular Python packages with C extensions — `psycopg2`, `numpy`, `pandas`, `cryptography` — either don't have prebuilt wheels for `musl` or require compiling from source against it, which is slower to build and occasionally produces subtly different behavior than the `glibc`-linked wheel most developers actually test against locally.
+
+```dockerfile
+# Stage 1 — builder: needs build tools for any C-extension packages
+FROM python:3.11-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Stage 2 — production: no compiler, no build tools, just the installed packages
+FROM python:3.11-slim AS production
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+COPY --from=builder /root/.local /home/appuser/.local
+COPY . .
+
+ENV PATH=/home/appuser/.local/bin:$PATH
+USER appuser
+
+# gunicorn, not `python app.py` — a real WSGI server for production, not a dev server
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "4", "app:app"]
+```
+
+**The choices that matter here, beyond what Q1/Q4 (Interview #1) already covered for image size in general:**
+- **`python:3.11-slim`**, not `alpine` — `slim` is Debian-based (real `glibc`), so it gets prebuilt wheels for virtually everything, while staying meaningfully smaller than the full `python:3.11` image.
+- **Build tools (`build-essential`, `libpq-dev` for `psycopg2`, etc.) only exist in the builder stage** — exactly the multi-stage principle from Q5, applied to Python instead of Java: the compiler that was needed to build a C extension never ships in the final image.
+- **`pip install --user`**, copied via `COPY --from=builder /root/.local ...` — keeps the installed packages isolated and copyable between stages without needing a full virtualenv, which would otherwise need its interpreter paths to line up exactly between stages.
+- **A real WSGI/ASGI server** (`gunicorn` for WSGI apps, `uvicorn`/`gunicorn -k uvicorn.workers.UvicornWorker` for ASGI/FastAPI) as the entrypoint — Flask/Django's built-in dev server is explicitly not meant for production and says so in its own startup warning.
+
+---
+
+**Side-by-side — where the two actually differ**
+
+| | Java | Python |
+|---|---|---|
+| **Biggest size lever** | JDK (build) → JRE (runtime), possibly `jlink` for a custom minimal runtime | `slim` (not `alpine`) base + multi-stage to drop build tools |
+| **Runtime-specific gotcha** | JVM heap sizing relative to the container's cgroup memory limit | C-extension packages needing `musl`-compatible wheels or a compiler, if using `alpine` |
+| **Production entrypoint concern** | Less of an issue — the JAR typically already runs its own embedded server (Spring Boot, etc.) | Must explicitly swap the framework's dev server for `gunicorn`/`uvicorn` |
+| **Non-root user** | Same principle, same syntax | Same principle, same syntax |
+
+---
+
+**Real-world example — CloudCart**
+
+`order-service` (Java/Spring Boot) uses the JDK→JRE multi-stage pattern from Q5, with `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0` specifically because an earlier version with a hardcoded `-Xmx` got OOMKilled repeatedly after a Kubernetes memory *limit* change that nobody thought to also update in the Dockerfile — the container-aware flag means the JVM now automatically adapts if the pod's memory limit is ever tuned again, without needing a code change in lockstep. A separate internal reporting service, written in Python, initially shipped on `python:3.11-alpine` for the smaller image size, but the build broke the first time a `pandas` upgrade shipped without a prebuilt `musl` wheel, forcing a from-source compile that made CI noticeably slower and occasionally flaky — switching to `python:3.11-slim` fixed both the build reliability and, counter-intuitively, ended up not much larger in practice once the multi-stage build was already dropping the compiler toolchain from the final image anyway.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Answer "yes" to both, then treat them as genuinely different problems,
+not the same Dockerfile pattern applied twice:
+
+Java:
+  → Multi-stage: JDK to build, JRE to run (Q5) — the size story
+  → NEW detail to volunteer: -XX:+UseContainerSupport +
+    MaxRAMPercentage instead of a hardcoded -Xmx, so the JVM adapts
+    to the container's actual memory limit instead of needing manual
+    sync whenever that limit changes
+  → jlink for an even smaller custom runtime, if size matters that much
+
+Python:
+  → Base image: slim (glibc, prebuilt wheels) over alpine (musl,
+    breaks/slows down C-extension packages like psycopg2/numpy/pandas)
+  → Multi-stage: build tools (gcc, libpq-dev) only in the builder stage
+  → pip install --user + COPY --from=builder, for a clean cross-stage
+    copy without needing a full virtualenv
+  → MUST swap the framework's dev server for gunicorn/uvicorn —
+    Flask/Django's built-in server explicitly isn't for production
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Yes, both — and they have different concerns, not the same Dockerfile pattern twice. For Java, I use the multi-stage JDK-to-build, JRE-to-run pattern, and specifically make sure the JVM is container-aware — using UseContainerSupport with MaxRAMPercentage instead of a hardcoded Xmx — because a fixed heap size doesn't adapt if the container's memory limit changes later, which caused a real OOMKill issue for us after a Kubernetes memory limit was tuned without anyone updating the Dockerfile to match. For Python, the detail I'd volunteer is to avoid Alpine despite it being the smallest option, because it uses musl instead of glibc, and popular packages with C extensions like psycopg2, numpy, or pandas either lack prebuilt wheels for musl or need to compile from source against it — slower builds, occasional flakiness. I use python-slim instead, still multi-stage so build tools like gcc only exist in the builder stage, install packages with pip install --user so they copy cleanly between stages, and always swap the framework's built-in dev server for gunicorn or uvicorn in production, since Flask and Django's dev servers explicitly aren't meant to run there."*
+
+---
+
+#### Q2. What is the difference between CMD and ENTRYPOINT in Docker?
+
+**Answer:**
+
+The core distinction, covered briefly in Q1 (Interview #1): `CMD` sets a **default** that `docker run` can freely override, `ENTRYPOINT` sets the **fixed** main process that isn't overridden by a plain argument — only by the explicit `--entrypoint` flag. Since this came up again as its own dedicated question, I'd go a level deeper than that table this time: **shell form vs. exec form**, and why that distinction actually matters for how a container shuts down, not just startup syntax.
+
+---
+
+**Quick recap of the override behavior**
+
+```dockerfile
+CMD ["node", "server.js"]
+```
+```bash
+docker run my-app                  # runs: node server.js
+docker run my-app node debug.js    # runs: node debug.js  — CMD fully replaced
+```
+
+```dockerfile
+ENTRYPOINT ["node", "server.js"]
+```
+```bash
+docker run my-app                  # runs: node server.js
+docker run my-app debug.js         # runs: node server.js debug.js — "debug.js" is
+                                    # appended as an ARGUMENT to the entrypoint,
+                                    # not a replacement for it
+docker run --entrypoint node my-app debug.js  # the only way to actually replace it
+```
+That last line is the detail worth stating explicitly: a plain trailing argument to `docker run` **never** replaces `ENTRYPOINT` — it just gets appended as an argument to whatever `ENTRYPOINT` already is. Overriding `ENTRYPOINT` itself requires the dedicated `--entrypoint` flag. This is exactly why `ENTRYPOINT` is the right choice when a container should always run through one specific executable no matter what.
+
+---
+
+**The genuinely deeper part: shell form vs. exec form — and why it matters for shutdown, not just syntax**
+
+Both `CMD` and `ENTRYPOINT` can be written two different ways, and which one is used has a real operational consequence, not just a style difference:
+
+```dockerfile
+# Shell form — Docker runs this via /bin/sh -c "..."
+CMD node server.js
+
+# Exec form — Docker runs the binary DIRECTLY, no shell in between
+CMD ["node", "server.js"]
+```
+
+**Shell form** wraps the command in `/bin/sh -c`, which means the shell process becomes PID 1 inside the container, and the actual application (`node`, in this example) runs as a **child** of that shell, not as PID 1 itself. This matters because Docker sends `SIGTERM` to PID 1 when stopping a container (`docker stop`, or a Kubernetes pod termination) — if PID 1 is a shell that doesn't forward signals to its child process (many shells don't, by default), the application never actually receives the `SIGTERM` at all, and Docker/Kubernetes ends up waiting out the full grace period before force-killing with `SIGKILL` — meaning the application never gets the chance to shut down gracefully (finish in-flight requests, close DB connections cleanly).
+
+**Exec form** runs the binary directly as PID 1, with no intermediary shell — `SIGTERM` reaches the application process immediately, which is what actually enables graceful shutdown to work at all.
+
+```
+Shell form:  docker stop → SIGTERM → /bin/sh (PID 1) → does NOT forward it → node never sees SIGTERM
+                                                          → full grace period wasted → SIGKILL
+
+Exec form:   docker stop → SIGTERM → node (PID 1) directly → app handles it, shuts down cleanly
+```
+
+**The trade-off shell form gives up in exchange:** shell form supports shell features directly — environment variable expansion (`CMD echo $HOME`), pipes, chaining with `&&` — because there's an actual shell interpreting the string. Exec form (`["echo", "$HOME"]`) does **not** expand `$HOME`, since there's no shell to interpret it — the array is passed straight to `exec()`. If shell features are genuinely needed with exec form, the explicit workaround is invoking a shell yourself inside the array: `CMD ["/bin/sh", "-c", "echo $HOME && node server.js"]` — which reintroduces the same signal-forwarding problem shell form has, just spelled out explicitly instead of implicitly. This is exactly why production Dockerfiles almost always use exec form for the final `CMD`/`ENTRYPOINT` — correct signal handling matters more than shell convenience for the process that's actually supposed to keep running.
+
+---
+
+**Side-by-side**
+
+| | CMD | ENTRYPOINT |
+|---|---|---|
+| Overridden by a plain `docker run` argument? | Yes, entirely replaced | No — the argument is appended, not a replacement |
+| Overridden by `--entrypoint`? | N/A | Yes, that's the only way |
+| Typical use | Default command/args, meant to be swappable (e.g., for debugging) | The fixed main process that should always run |
+| Shell form risk | Same signal-forwarding issue as ENTRYPOINT's shell form | PID 1 is a shell, `SIGTERM` may not reach the app |
+| Common combined pattern | `CMD` supplies default *arguments* | `ENTRYPOINT` supplies the fixed *executable* |
+
+**The combined pattern, revisited with exec form specifically:**
+```dockerfile
+ENTRYPOINT ["node"]
+CMD ["server.js"]
+```
+`docker run my-app` → `node server.js`. `docker run my-app debug.js` → `node debug.js` (only the `CMD` portion swaps). Both are exec form here, so `node` genuinely ends up as PID 1 either way — the override flexibility of `CMD` and the signal-handling correctness of exec form aren't in tension with each other.
+
+---
+
+**Real-world example — CloudCart**
+
+An early version of one of CloudCart's Node.js services used shell-form `CMD node src/server.js`. During a rolling deployment, pods consistently took the **full** `terminationGracePeriodSeconds` (30s) to terminate, even though the application had explicit `SIGTERM` handling written to close its database pool cleanly within a couple of seconds — the handler simply never ran, because `/bin/sh` was PID 1 and wasn't forwarding the signal to the `node` process underneath it. Switching to exec form, `CMD ["node", "src/server.js"]`, fixed it immediately — `node` became PID 1 directly, the application's own `SIGTERM` handler started firing as intended, and pod termination during deploys dropped from the full 30-second grace period down to roughly 2 seconds, matching how long the graceful-shutdown code actually took to run.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Two layers to this answer:
+
+1. The basic override behavior (already covered briefly in Q1,
+   Interview #1):
+   CMD        → fully replaced by a plain docker run argument
+   ENTRYPOINT → argument is APPENDED, not replaced — need
+                --entrypoint to actually override it
+
+2. The deeper, more interesting part — shell form vs exec form:
+   Shell form  → /bin/sh -c "..." becomes PID 1, app is a CHILD
+                 process → SIGTERM may never reach it → graceful
+                 shutdown silently doesn't work, full grace period
+                 wasted before SIGKILL
+   Exec form   → the binary itself is PID 1 → SIGTERM reaches it
+                 directly → graceful shutdown actually works
+   Trade-off   → shell form gets env var expansion/pipes for free;
+                 exec form needs an explicit /bin/sh -c wrapper if
+                 those are genuinely needed, which reintroduces the
+                 same signal problem on purpose, not by accident
+
+Production default: exec form for both CMD and ENTRYPOINT, always
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"At the basic level, CMD sets a default that's fully replaced by any argument passed to docker run, while ENTRYPOINT sets a fixed process — a plain argument gets appended to it instead of replacing it, so overriding ENTRYPOINT actually requires the --entrypoint flag. The deeper part I'd add is shell form versus exec form, since that has a real operational consequence, not just a syntax difference. Shell form — CMD node server.js — runs the command through /bin/sh -c, so the shell becomes PID 1 and the app is just a child process; Docker sends SIGTERM to PID 1 on shutdown, and if that shell doesn't forward the signal, which many don't by default, the app never receives it at all, and the container sits out the full grace period before getting SIGKILLed. Exec form — CMD ["node", "server.js"] — runs the binary directly as PID 1, so SIGTERM reaches the app immediately and graceful shutdown actually works. I've seen this exact issue in production — a service using shell form was taking the full 30-second termination grace period on every rolling deploy despite having its own SIGTERM handler written, because that handler simply never ran. Switching to exec form fixed it immediately, and shutdown time dropped to about 2 seconds, which is why I use exec form for CMD and ENTRYPOINT by default now, not just when I happen to remember."*
+
+---
+
+<!-- Add more scenario questions as Scenario 1, Scenario 2... -->
+
+---
+
 <!--
 To add a new interview, copy the block below and paste it at the bottom:
 
-## Interview #3
+## Interview #4
 
 **Company:**
 **Date:**

@@ -37,6 +37,7 @@
   - [Q1. Define an Azure Virtual Network (VNet) with a given IP range](#q1-define-an-azure-virtual-network-vnet-with-a-given-ip-range)
   - [Q2. Set up an Azure Bastion Host for secure access to the VMs](#q2-set-up-an-azure-bastion-host-for-secure-access-to-the-vms)
   - [Q3. Configure an Azure Load Balancer to route traffic to the application VMs](#q3-configure-an-azure-load-balancer-to-route-traffic-to-the-application-vms)
+  - [Q4. Create 10 EC2 instances with the same configuration but different names — one by one, or is there an optimization?](#q4-suppose-you-want-to-create-10-aws-ec2-instances-with-the-same-cpu-memory-and-other-configuration-but-only-the-name-is-different-would-you-create-them-one-by-one-or-is-there-an-optimization-technique)
 
 ---
 
@@ -5858,6 +5859,116 @@ multiple AZs + 2+ backend instances for that.
 **Summary (what to say if time is short):**
 
 *"First I'd confirm this genuinely needs Layer 4 load balancing — Azure Load Balancer distributes TCP/UDP traffic with no HTTP awareness at all, the equivalent of an AWS NLB. If the actual need is path-based routing, SSL offload, or a WAF, that's Application Gateway instead, Azure's Layer 7 service, equivalent to an AWS ALB — picking the wrong one means hitting a capability wall partway through. Assuming Layer 4 is genuinely right: I'd configure a Standard SKU load balancer, since Basic is being retired and lacks zone redundancy, with a frontend IP configuration, a backend address pool pointing at the application VMs — ideally a VM Scale Set rather than individually managed VMs — a health probe checking a real health endpoint, and a load balancing rule tying the frontend port to the backend pool via that probe. For real HA, I'd make sure the backend has at least two instances spread across Availability Zones, since the load balancer itself only routes to healthy backends — it doesn't create the redundancy on its own."*
+
+---
+
+#### Q4. Suppose you want to create 10 AWS EC2 instances with the same CPU, memory, and other configuration, but only the name is different. Would you create them one by one, or is there an optimization technique?
+
+**Answer:**
+
+Definitely not one by one — writing 10 nearly-identical `resource "aws_instance"` blocks is exactly the kind of copy-paste Terraform is designed to eliminate. The right tool is one of the two **meta-arguments** Terraform provides for creating multiple instances of the same resource block: **`count`** or **`for_each`**. Both avoid the duplication, but they behave differently enough — especially once you start adding or removing instances later — that picking the right one matters, not just "either works."
+
+---
+
+**Option 1 — `count`: simple, index-based repetition**
+
+```hcl
+variable "instance_names" {
+  type    = list(string)
+  default = ["web-01", "web-02", "web-03", "web-04", "web-05",
+             "web-06", "web-07", "web-08", "web-09", "web-10"]
+}
+
+resource "aws_instance" "app" {
+  count = length(var.instance_names)
+
+  ami           = "ami-0abcdef1234567890"
+  instance_type = "t3.medium"
+
+  tags = {
+    Name = var.instance_names[count.index]
+  }
+}
+```
+This creates 10 instances, each addressed internally as `aws_instance.app[0]` through `aws_instance.app[9]`, with `count.index` used to pull the matching name out of the list.
+
+**The real gotcha with `count`, worth stating without being asked:** these resources are tracked in state by **numeric index**, not by name. If `"web-03"` is removed from the middle of that list, every subsequent element **shifts down by one index** — `web-04` becomes index 2 instead of 3, `web-05` becomes index 3, and so on. Terraform sees that as index 3 through 9 all having *different* values than what's in state, and plans to **destroy and recreate** every one of them, even though only one instance was actually meant to go away. For a fleet of stateless web servers that might be tolerable; for anything with local state or where recreation is disruptive, it's a real production risk hiding in a seemingly simple loop.
+
+---
+
+**Option 2 — `for_each`: keyed by a stable identity, not a position**
+
+Since the requirement here is literally "same everything, only the **name** differs," the name is a natural, stable, unique key — which makes `for_each` the better fit:
+
+```hcl
+variable "instance_names" {
+  type    = set(string)
+  default = ["web-01", "web-02", "web-03", "web-04", "web-05",
+             "web-06", "web-07", "web-08", "web-09", "web-10"]
+}
+
+resource "aws_instance" "app" {
+  for_each = var.instance_names
+
+  ami           = "ami-0abcdef1234567890"
+  instance_type = "t3.medium"
+
+  tags = {
+    Name = each.value
+  }
+}
+```
+Each instance is now addressed by its **name**, not a number — `aws_instance.app["web-03"]`, `aws_instance.app["web-07"]`, etc. Removing `"web-03"` from the set now does exactly what you'd expect: Terraform destroys **only** `aws_instance.app["web-03"]` — every other instance's key is unaffected, because nothing is positionally shifted. This is the behavior most people actually want when they picture "manage a named list of similar resources," and it's the reason `for_each` is generally the safer default whenever the items have a natural, distinguishing identity like a name.
+
+---
+
+**Side-by-side**
+
+| | `count` | `for_each` |
+|---|---|---|
+| Keyed by | Numeric index (`[0]`, `[1]`, ...) | A map key or set value (`["web-03"]`) |
+| Removing an item from the middle | **Cascading recreation** of every subsequent index | Only that one resource is destroyed |
+| Best input type | A plain number, or a list where order/position is genuinely meaningless | A map or set where each item has a natural, unique identity (a name, an ID) |
+| Referencing an instance | `aws_instance.app[2]` | `aws_instance.app["web-03"]` |
+| Right fit for "10 instances, only the name differs" | Works, but fragile if the list is ever edited | **Yes — this is exactly its intended use case** |
+
+---
+
+**Real-world example — CloudCart**
+
+An early version of a batch of CloudCart's internal tooling VMs used `count` over a plain list of names. Removing one decommissioned VM from the middle of that list caused Terraform to plan destroying and recreating **six other, perfectly healthy VMs** whose only "change" was their index shifting — caught in `terraform plan` review before it was ever applied, but it was a clear signal the pattern was wrong for that use case. Migrating to `for_each` over a `set(string)` of VM names fixed it permanently — removing a VM from the variable now only ever destroys that specific one, and adding a new name only ever creates that one new instance, with zero effect on the others' state.
+
+---
+
+**Complete thought process — how I approach this in the interview**
+
+```
+Never one-by-one — that's exactly the repetition Terraform meta-
+arguments exist to remove: count or for_each, looping ONE resource
+block instead of writing it N times
+
+count:
+  → simplest for a fixed number / positionally-meaningless list
+  → GOTCHA: indexed by position — removing a middle item shifts
+    every later index, causing Terraform to destroy/recreate
+    resources that didn't actually need to change
+
+for_each:
+  → keyed by the actual value (a set) or a map key — not position
+  → removing one item only ever affects that one resource
+  → the right fit whenever items have a natural unique identity —
+    which "different name, same everything else" IS, exactly
+
+For THIS specific question — 10 instances, name is the only
+difference — for_each over a set of names is the textbook-correct
+answer, not just "either count or for_each works fine"
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Definitely not one by one — that's exactly what Terraform's count and for_each meta-arguments exist to avoid, letting one resource block create all ten. Between the two, I'd specifically reach for for_each here rather than count, because the name is the one thing that varies, and a name is a natural, stable key — for_each addresses each instance by that key, like aws_instance.app['web-03'], rather than by a numeric index. That distinction actually matters in practice: with count, removing one item from the middle of the list shifts every later index, and Terraform ends up planning to destroy and recreate every instance after that point, even though only one was ever meant to change — I've actually seen that happen, where removing one decommissioned VM from a count-based list triggered a plan to recreate six unrelated, healthy VMs, caught in review before it applied. Switching that to for_each over a set of names fixed it permanently — removing or adding one name now only ever affects that one specific instance."*
 
 ---
 
