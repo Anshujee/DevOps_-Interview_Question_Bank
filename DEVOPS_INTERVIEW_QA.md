@@ -28,6 +28,8 @@
   - [Q7. How would you implement a zero-downtime rolling update strategy while ensuring resource quotas, pod disruption budgets, and horizontal pod autoscaling are correctly configured?](#q7-in-a-kubernetes-cluster-running-production-workloads-how-would-you-approach-implementing-a-zero-downtime-rolling-update-strategy-while-also-ensuring-that-resource-quotas-pod-disruption-budgets-and-horizontal-pod-autoscaling-are-correctly-configured)
   - [Q8. \[TEMPLATE — see warning\] You automated repetitive support tasks using AWS Lambda and Python, achieving a 40% reduction in manual intervention — selection criteria and validation approach?](#q8-you-automated-repetitive-support-tasks-using-aws-lambda-and-python-scripts-achieving-a-40-reduction-in-manual-intervention-what-criteria-did-you-use-to-identify-which-tasks-were-suitable-for-automation-and-how-did-you-validate-that-the-automation-was-reliable-before-deploying-it-to-production)
   - [Q9. Designing a VPC on AWS for a multi-tier app needing strict segmentation between public services, internal APIs, and databases — what components and controls enforce least privilege?](#q9-when-designing-a-vpc-architecture-on-aws-for-a-multi-tier-application-that-requires-strict-network-segmentation-between-public-facing-services-internal-apis-and-database-layers-what-networking-components-and-security-controls-would-you-put-in-place-to-enforce-least-privilege-access)
+  - [Q10. How would you structure a knowledge-sharing program so critical infrastructure knowledge stays documented, accessible, and continuously updated as systems evolve?](#q10-as-someone-who-has-mentored-junior-engineers-how-would-you-structure-a-knowledge-sharing-program-within-a-devops-team-to-ensure-that-critical-infrastructure-knowledge-is-documented-accessible-and-continuously-updated-as-systems-evolve)
+  - [Q11. How would you design and test a disaster recovery plan for a Kubernetes app on EKS — backup strategy for persistent volumes, RDS snapshots, and RTO validation?](#q11-describe-how-you-would-design-and-test-a-disaster-recovery-plan-for-a-kubernetes-based-application-hosted-on-aws-eks-including-your-approach-to-backup-strategies-for-persistent-volumes-database-snapshots-using-rds-and-recovery-time-objective-validation)
 
 ---
 
@@ -2204,5 +2206,230 @@ Layer, don't rely on one control
 **Summary (what to say if time is short):**
 
 *"I'd describe the pattern honestly against a real example rather than a textbook diagram: my actual AWS VPC today is two-tier, not three — EKS nodes and RDS currently share the same private subnets, and I found a real gap doing this review — the RDS security group's comment claims it only allows EKS nodes, but the actual rule scopes ingress to the entire VPC CIDR block, not the EKS security group specifically. The correct least-privilege fix is a security-group-to-security-group reference instead of a CIDR block, so the rule says 'only traffic carrying this exact SG' rather than 'anything on this network.' For a true three-tier design, I'd add a dedicated data subnet tier separate from the app tier, chain security groups ALB→EKS-nodes→RDS so each layer only accepts traffic from the specific SG immediately upstream of it, add Network ACLs as a second stateless layer so a misconfigured security group alone can't open cross-tier traffic, and add VPC endpoints for ECR, Secrets Manager, and CloudWatch Logs so application traffic to AWS services never has to leave the AWS private network at all. I know this pattern works because I've already built its equivalent for real on Azure — AzureShop has three genuinely separate subnets for the gateway, AKS, and the database, each with its own NSG, and the SQL firewall rule is scoped to the AKS subnet's exact CIDR range rather than the whole VNet — which is precisely the fix I'd port back to fix FinBank's RDS rule."*
+
+---
+
+#### Q10. As someone who has mentored junior engineers, how would you structure a knowledge-sharing program within a DevOps team to ensure that critical infrastructure knowledge is documented, accessible, and continuously updated as systems evolve?
+
+**Answer:**
+
+I'll answer this by describing the actual documentation system I already build and live in for my own projects — the test I apply is "could a junior engineer with zero prior context self-serve from this," which is the same bar good mentoring documentation has to clear. Three concrete patterns, all real, not aspirational, plus how I'd wrap a live program around them.
+
+---
+
+**1. A fixed, repeatable template for capturing incidents — written for a beginner, not for the person who already knows the answer**
+
+AzureShop has a real `LESSONS_LEARNED.md` with **10 documented issues** from actual deployment blockers I hit, every single one following the exact same structure:
+
+```
+What Happened          — the story, in plain language
+The Concept Explained   — the background a junior engineer needs
+                          BEFORE the fix makes sense (e.g., what
+                          soft-delete/purge-protection actually is,
+                          before explaining why it blocked a rebuild)
+Why It Happened         — root cause, not just symptom
+The Exact Error Message — so it's instantly recognizable next time,
+                          searchable verbatim
+How To Fix It           — exact commands, explained, not just pasted
+How To Prevent It       — the actual behavior change going forward
+```
+
+The part that makes this a *teaching* document rather than just a runbook is the **"Concept Explained" step** — it doesn't assume the reader already knows what a soft-deleted Key Vault or a stale Terraform lock actually is. A senior engineer writing a fix for themselves would skip straight to the commands; writing it for a junior engineer means explaining the concept the fix depends on, every time, even if it feels repetitive to the person who already knows it. That's a deliberate design choice, not an oversight.
+
+**2. Making the process itself a knowledge artifact — not just the docs**
+
+FinBank's `CONTRIBUTING.md` ties every branch and commit to a ticket number:
+
+```
+feature/FBP-115-add-analytics-ecr
+bugfix/FBP-119-fix-secretsmanager-outputs
+```
+
+This means **git history itself becomes a searchable knowledge base.** A junior engineer six months from now looking at a confusing piece of infrastructure can run `git log` on that file, find `FBP-119`, and trace back to exactly why that decision was made — without needing to find and interrupt whoever wrote it. Good documentation isn't only the wiki pages; making the commit history itself traceable is a knowledge-sharing decision, not just a process rule.
+
+**3. Q&A-format docs with a table of contents, appended incrementally as real questions come up — not written once, upfront, as a wall of documentation nobody reads**
+
+This is the literal pattern I'm using **right now**, in two live repos: a Terraform concepts doc with a clickable table of contents that gets one new `## Qn.` section added every time a real question comes up, and this very interview-questions repo, structured the same way. The reason this scales better than a big upfront wiki dump: **every entry exists because someone actually needed it**, so the docs track what real gaps existed rather than what a documentation exercise imagined junior engineers might one day ask. The table of contents with anchor links is the small mechanical piece that keeps it navigable — the value degrades fast if a growing doc isn't scannable at a glance.
+
+---
+
+**What I'd add to turn "good docs exist" into an actual program**
+
+Real docs are necessary but not sufficient — a program needs venues and forcing functions around them:
+
+| Mechanism | What it forces |
+|---|---|
+| Doc updates required in the same PR as the infra change that invalidates them | Docs can't silently go stale — reviewers reject a PR that changes behavior without touching the doc that describes it, the same discipline as requiring tests |
+| Capture a lessons-learned entry within 24–48 hours of any real incident | Details are still fresh — root cause and exact error text get lost fast once the fire is out and everyone's moved on |
+| A "quick reference" summary table at the top or end of any growing lessons-learned doc | Someone under time pressure during a live incident needs to scan symptoms fast, not read 10 full write-ups to find the one that matches |
+| New engineer's first week: fix (or attempt) one item from the lessons-learned doc, paired with someone who's actually hit it | Tests whether the doc is genuinely self-serve-able, not just something that exists — if they get stuck, that's a signal the doc needs a rewrite, not that they need more hand-holding |
+| Periodic re-scoring, not a one-time audit | The FinBank self-review I mentioned in an earlier answer — scoring reliability/security and tracking a priority list — is itself a knowledge-sharing artifact; re-running it periodically keeps "what's actually true about this system today" from silently drifting away from what the original docs said |
+
+---
+
+**Complete thought process — how I'd walk through this live in an interview**
+
+```
+Lead with real artifacts, not a hypothetical program
+  → AzureShop's 10-issue LESSONS_LEARNED.md (fixed template,
+    beginner-first "concept explained" step), FinBank's
+    ticket-linked commit convention, and the live TOC-based
+    Q&A docs I'm building across two repos right now.
+
+What makes documentation actually MENTOR-grade, not just docs?
+  → Explaining the concept BEFORE the fix, every time — the
+    step a senior engineer would be tempted to skip because
+    they already know it.
+
+How does it stay current as systems evolve, not go stale?
+  → Doc updates required in the same PR as the change that
+    invalidates them. Lessons captured within 24-48h of an
+    incident, while detail is still fresh. Periodic re-scoring
+    of the whole system, not a one-time audit.
+
+How do I know the docs actually WORK, not just exist?
+  → Have a new engineer try to self-serve from one, paired
+    with someone who's hit it before — if they get stuck, the
+    doc needs a rewrite, not the engineer more supervision.
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"I'd build the program around three things I already do for real, not a hypothetical process. First, a fixed template for every documented incident — what happened, the underlying concept explained in plain language before the fix, root cause, the exact error text, the fix, and how to prevent it — the concept-explained step specifically is what makes it teaching material instead of just a runbook, since it doesn't assume the reader already knows what the senior engineer knows. Second, tying every commit and branch to a ticket number so git history itself becomes searchable knowledge, not just the wiki. Third, Q&A-format docs with a clickable table of contents that grows one real question at a time instead of being written upfront as a wall of documentation nobody reads — I'm literally doing this right now across two repos. On top of those artifacts, the actual program needs forcing functions: doc updates required in the same PR as the infra change that invalidates them, lessons captured within a day or two of any real incident while detail is fresh, and — the way I'd actually verify it's working — having a new engineer try to self-serve from a doc paired with someone who's hit that issue before. If they get stuck, that tells me the doc needs a rewrite, not that the engineer needs more hand-holding."*
+
+---
+
+#### Q11. Describe how you would design and test a disaster recovery plan for a Kubernetes-based application hosted on AWS EKS, including your approach to backup strategies for persistent volumes, database snapshots using RDS, and recovery time objective validation.
+
+**Answer:**
+
+The framing I'd lead with, because it's an honest and deliberate architectural fact about FinBank, not an oversight: **there are zero PersistentVolumeClaims anywhere in this EKS cluster.** Every workload — backend, frontend, analytics — is fully stateless; all real state lives in managed AWS services (RDS, ElastiCache). I checked this directly rather than assuming it. That's actually a real DR *strategy*, not a gap — it means "backing up the cluster" reduces to two much smaller problems: back up the managed data services, and treat the Kubernetes layer itself as disposable and rebuildable from Git. I'll cover both, then the general PV approach for teams that do have in-cluster storage, then be honest that I haven't run a full live DR drill on this project — and describe exactly how I would.
+
+---
+
+**1. The Kubernetes/EKS layer — disposable by design, not backed up directly**
+
+Because everything here is stateless and GitOps-managed (see the earlier ArgoCD answer), the actual "backup" of the cluster's desired state **is the Git repo**, not a snapshot of the cluster itself:
+
+```
+Disaster: EKS cluster / region is gone
+       │
+       ▼
+1. terraform apply   — same module code from Q3's answer, rebuilds
+                        VPC, EKS, RDS(from snapshot), ECR, etc. —
+                        because the modules are already
+                        region-agnostic and reusable, not rewritten
+       │
+       ▼
+2. Install ArgoCD    — points at the same Infra repo it always did
+       │
+       ▼
+3. ArgoCD auto-syncs — every Deployment, Service, HPA, PDB rebuilds
+                        itself from Git, exactly as declared —
+                        no manual redeploy of any of the 9
+                        ArgoCD-managed applications
+```
+
+**One clarification worth stating explicitly, because it's a common point of confusion:** the EKS *control plane*, including etcd, is fully AWS-managed and already multi-AZ by default — that's not something I back up or manage myself; it's covered by EKS's own SLA. What I'm actually responsible for backing up is the **data layer** and the **Git-declared desired state** — not Kubernetes' own internals.
+
+---
+
+**2. RDS — the real backup story, including a real gap I'd flag rather than hide**
+
+What's actually configured today:
+
+```hcl
+backup_retention_period = 7                    # 7 days of automated backups
+backup_window            = "03:00-04:00"        # low-traffic window, IST
+maintenance_window       = "Mon:04:00-Mon:05:00"
+multi_az                 = var.multi_az         # false in dev, would be true in prod
+```
+
+- **Automated backups give point-in-time recovery**, not just daily snapshots — RDS backs up transaction logs continuously within the retention window, so I can restore to almost any point in the last 7 days, not just to a nightly checkpoint. That's the concrete mechanism behind an RPO measured in minutes rather than a full day, tying directly back to how I think about RPO in general.
+- **Multi-AZ** is a synchronous standby in a second AZ with automatic failover in about 60 seconds if the primary fails — that's the RTO lever specifically for an AZ-level failure, separate from backups (which cover data loss / corruption / accidental deletion, not availability).
+
+**The honest gap, checked directly against the current state, not assumed:** `deletion_protection` is currently set to **`false`**. That's a real, present risk I'd flag in an interview rather than skip past — it means nothing at the AWS level currently stops a `terraform destroy` or an accidental console deletion from actually deleting the production database, backups notwithstanding the retention window. Flipping it to `true` for the prod environment is a one-line Terraform change and belongs at the top of any real DR hardening list, not backups.
+
+**The other gap I checked and am comfortable deprioritizing, not just missing:** ElastiCache (Redis) has **no snapshot/backup configuration at all** today. I'd call this an acceptable, deliberate risk rather than an oversight to fix immediately — Redis here holds session/cache data, which is disposable and gets rebuilt from RDS-backed source data the moment the cache is empty; it's not the source of truth for anything. I'd rank it below `deletion_protection` on any real priority list, and say so directly if asked to defend that ranking.
+
+---
+
+**3. Persistent Volumes — the general approach, for when they do exist**
+
+Since I don't have real PVs to point to, I'll describe the standard tool rather than invent a fake war story: **Velero**, backed by S3, using the CSI snapshot integration for the actual EBS volume data:
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-pv-backup
+spec:
+  schedule: "0 2 * * *"     # 2am daily
+  template:
+    includedNamespaces: ["finbank-prod"]
+    snapshotVolumes: true    # triggers EBS CSI snapshots, not just object backup
+    storageLocation: s3-backup-bucket
+    ttl: 168h0m0s             # 7 days retention — same window as RDS, for consistency
+```
+
+Velero backs up both the **Kubernetes object manifests** (so a namespace's Deployments/Services/PVC definitions can be recreated) and, via the CSI snapshot integration, the **actual EBS volume contents** the PVCs point to — restoring `velero restore create --from-backup daily-pv-backup-20260830` recreates both the objects and re-provisions volumes from the snapshotted data. I'd store the S3 bucket cross-region, for the same reason a single-region backup is only half a DR plan — a full region failure needs the backup to already exist somewhere else.
+
+---
+
+**4. RTO validation — the part I have NOT done, and how I'd actually do it**
+
+Consistent with what I said about cross-cloud failover earlier in this interview: I have not run a real, timed, end-to-end DR drill on this project. I'd rather say that directly than claim a number I never measured. Here's exactly how I'd validate a real RTO instead of assuming one:
+
+```
+Game-day drill (scheduled, not a surprise the first time):
+1. Restore RDS from the latest automated snapshot into a FRESH
+   instance in a separate account/region — time it, don't estimate it
+2. terraform apply the full stack from scratch against that restored DB
+   — time it
+3. ArgoCD sync until every one of the 9 applications reports Healthy
+   — time it
+4. Smoke-test the actual application (login, a transaction) against
+   the recovered environment — not just "pods are Running"
+5. Add up all four timings = the REAL measured RTO, not the
+   theoretical one from adding up documented SLAs
+```
+
+The reason step-by-step timing matters more than a single end-to-end stopwatch: it tells you **which step to optimize first**. If the RDS restore is 20 minutes and the Terraform apply is 25, working on Terraform speed is the higher-leverage fix; if you only measure the total, you're guessing. I'd run this on a real schedule — quarterly at minimum — specifically because infrastructure changes over time (new modules, new services, more data to restore) and an RTO measured once goes stale exactly the way documentation does, which is the same "measure, don't just document once" discipline as the production-readiness scoring I described in an earlier answer.
+
+---
+
+**Complete thought process — how I'd walk through this live in an interview**
+
+```
+Lead with the real architecture, not a generic DR checklist
+  → Zero PVs — stateless K8s + managed AWS data services is
+    itself the DR strategy. Say this is deliberate, not missing.
+
+RDS — real numbers, one real gap flagged honestly
+  → 7-day automated backups = point-in-time recovery, not just
+    daily snapshots. Multi-AZ = ~60s automatic failover.
+  → deletion_protection is CURRENTLY false — real, checked,
+    top of the priority list, ahead of anything else here.
+  → Redis has no snapshots — deliberately deprioritized, not
+    missed, because it's disposable cache data.
+
+PVs — describe the tool honestly, don't fake a war story
+  → Velero + S3 + CSI snapshots, cross-region storage, same
+    retention window as RDS for consistency.
+
+RTO validation — the most important honesty check of this answer
+  → Never run a real timed drill on this project. Describe
+    EXACTLY how I would: time each step separately (restore,
+    apply, sync, smoke test), not just a single stopwatch —
+    so you know which step to optimize, not just the total.
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"The most important fact about this system's DR posture is that there are zero persistent volumes in the EKS cluster — everything is stateless, with all real state in RDS and ElastiCache. That's a deliberate design, not a gap, and it means the DR plan splits into two much simpler problems: back up the managed data services, and treat the Kubernetes layer as disposable and rebuildable from Git via Terraform plus ArgoCD. For RDS, 7-day automated backups give point-in-time recovery within that window, and Multi-AZ gives roughly 60-second automatic failover for an availability event — but I'd be upfront about a real gap I checked directly: deletion_protection is currently false, which I'd flag as the top priority fix, ahead of anything else in this answer. For persistent volumes in general, I'd use Velero with CSI snapshot integration into cross-region S3, on the same retention window as RDS for consistency. The part I want to be most honest about is RTO validation — I haven't run a real timed DR drill on this project, and I'd rather say that than invent a number. What I'd actually do is a scheduled game-day: restore RDS from a real snapshot into a fresh environment, run Terraform from scratch, let ArgoCD sync, and smoke-test the real application — timing each step separately, not just the total, because that's what tells you which part of the recovery to actually optimize first."*
 
 ---
