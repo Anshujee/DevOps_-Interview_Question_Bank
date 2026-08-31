@@ -18,6 +18,8 @@
   - [Q3. You said you have worked on automation. What kind of automation have you done? Can you elaborate?](#q3-you-said-you-have-worked-on-automation-what-kind-of-automation-have-you-done-can-you-elaborate)
   - [Q4. Can you explain a real-time example of automation you have implemented? What is the most common automation implemented by a DevOps engineer?](#q4-can-you-explain-a-real-time-example-of-automation-you-have-implemented-what-is-the-most-common-automation-implemented-by-a-devops-engineer)
   - [Q5. Have you implemented Prometheus/Grafana in your current or recent project?](#q5-have-you-implemented-prometheusgrafana-in-your-current-or-recent-project)
+- [Interview #3 — Wipro | Senior DevOps Engineer | Technical Round 2](#interview-3)
+  - [Q1. Describe a complex cloud infrastructure project you worked on, where you had to manage multi-cloud environments across AWS and Azure...](#q1-describe-a-complex-cloud-infrastructure-project-you-worked-on-where-you-had-to-manage-multi-cloud-environments-across-aws-and-azure-walk-through-the-challenges-you-faced-the-decisions-you-made-regarding-infrastructure-design-and-how-you-ensured-high-availability-and-reliability-throughout-the-project)
 
 ---
 
@@ -870,3 +872,149 @@ To add a new interview, copy the block below and paste it at the bottom:
 
 ---
 -->
+
+## Interview #3
+
+**Company:** Wipro
+**Date:** 31-08-2026
+**Role Applied For:** Senior DevOps Engineer
+**Round:** Technical Round 2
+**Interviewer Level:** Not specified
+
+---
+
+### Questions Asked
+
+#### Q1. Describe a complex cloud infrastructure project you worked on, where you had to manage multi-cloud environments across AWS and Azure. Walk through the challenges you faced, the decisions you made regarding infrastructure design, and how you ensured high availability and reliability throughout the project.
+
+**Answer:**
+
+The honest framing I'd give here, because it's the framing that survives follow-up questions: my multi-cloud experience doesn't come from one single workload that spans AWS and Azure at the same time — it comes from building **two separate, production-grade platforms end-to-end, one entirely on AWS and one entirely on Azure**. That's actually a stronger answer than pretending it was one hybrid system, because it means I've made the *same* category of infrastructure decisions — compute orchestration, database HA, secrets management, ingress/WAF, GitOps — twice, on two different clouds, and can talk concretely about where the equivalent services differ.
+
+---
+
+**Project 1 — FinBank (AWS): a banking platform on EKS**
+
+FinBank is a banking-style platform — user management, account operations, fund transfers (NEFT/RTGS/IMPS/UPI-style), and a real-time analytics service — built as three microservices:
+
+| Service | Stack |
+|---|---|
+| Backend | Spring Boot (Java), 18 REST APIs |
+| Frontend | React (Vite) |
+| Analytics | FastAPI (Python) |
+
+**Infrastructure design decisions:**
+- **Compute:** Amazon EKS (Kubernetes 1.31), across **2 Availability Zones** (`ap-south-1a`/`ap-south-1b`), with public and private subnets per AZ — public for the NAT/ALB layer, private for the actual worker nodes, so nodes are never directly internet-facing.
+- **Multi-environment on one cluster:** dev, staging, and prod all run on the same EKS cluster but in separate namespaces (`finbank-dev`, `finbank-stage`, `finbank-prod`), each with its own AWS ALB via the Kubernetes ingress controller — namespace + ALB isolation instead of three separate clusters, which kept cost down for a portfolio-scale project while still practicing "real" multi-env separation.
+- **Database:** RDS MySQL, built with a `multi_az` variable in the Terraform module specifically so Multi-AZ (synchronous standby in a second AZ, automatic failover) is a one-line toggle — off for dev/cost, the variable that gets flipped on for anything closer to production.
+- **GitOps, not manual `kubectl apply`:** Jenkins builds and pushes images to ECR, then commits an updated image tag into this same infra repo's Helm `values.yaml`. **ArgoCD** watches that repo and auto-syncs the cluster to match Git. This is a deliberate reliability decision, not just a CI/CD nicety — it means the cluster state is a *reconciled reflection of Git*, so if anyone (including me, debugging) makes a manual change directly on the cluster, ArgoCD detects the drift and reconciles it back to what's declared in Git.
+- **Secrets:** zero secrets in Git or in Helm values. AWS Secrets Manager → **External Secrets Operator**, authenticating via **IRSA** (IAM Roles for Service Accounts — no long-lived AWS keys anywhere) → synced into native Kubernetes Secrets, mounted as env vars.
+
+**High availability specifics on `finbank-prod`:**
+
+| Mechanism | Config |
+|---|---|
+| HPA (backend) | min 2, max 5 pods, target 70% CPU |
+| HPA (frontend) | min 2, max 4 pods, target 70% CPU |
+| PodDisruptionBudget | minAvailable: 1 (backend + frontend) — guarantees at least one pod survives a voluntary node drain/upgrade |
+| ResourceQuota | caps the namespace so one runaway service can't starve the others on a shared cluster |
+
+**Real challenges I ran into (and the trade-offs behind them):**
+- **Single NAT gateway in dev.** The VPC module places one NAT gateway in the first public subnet rather than one per AZ. That's a deliberate cost-vs-availability trade-off for a dev environment — one NAT is a single point of failure for private-subnet internet egress if that AZ has an issue, but a second NAT roughly doubles NAT cost for a workload that doesn't need production-grade resilience. The decision I'd flag out loud in an interview: this is exactly the kind of thing that must change — one NAT gateway per AZ — the moment this design moves toward production.
+- **ALB controller couldn't discover the VPC ID from instance metadata** on first install — fixed by passing `--set vpcId=<VPC_ID>` explicitly to the Helm install instead of relying on auto-detection.
+- **ArgoCD's ApplicationSet CRD was too large** for a plain `kubectl apply` — needed `--server-side` to install it at all, which was a new failure mode I hadn't hit before that scale of CRD.
+- **Node capacity planning was concrete, not guesswork:** each `t3.medium` node supports roughly 17 pods before hitting the EKS pod-per-node ENI limit, which is why the node group is sized at 3 nodes for three environments sharing a cluster, and scaled to 4 once the monitoring stack (Prometheus/Grafana) was added — a real capacity number I calculated rather than assumed.
+
+---
+
+**Project 2 — AzureShop (Azure): a 3-tier e-commerce platform on AKS**
+
+AzureShop is a 3-tier e-commerce platform — Next.js storefront, 6 backend microservices (mostly Node.js, one Python/FastAPI), and three different data stores chosen deliberately per access pattern.
+
+**Infrastructure design decisions:**
+- **Compute:** AKS with **three separate node pools** instead of one — a `system` pool (runs only Kubernetes system components), a `user` pool with autoscaling enabled for the actual application workloads, and a `spot` pool for anything that can tolerate interruption, to cut cost on non-critical workloads.
+- **Edge/WAF:** Azure Application Gateway v2 in front of everything, running the **OWASP 3.2** rule set plus Microsoft's BotManager ruleset, in **Prevention mode** (blocks matching requests, doesn't just log them), autoscaling 1–5 instances, doing SSL termination so traffic inside the AKS cluster is plain HTTP behind the WAF boundary.
+- **Databases chosen per access pattern, not one-size-fits-all:** Azure SQL for `user-service`/`order-service` (relational, needs ACID for money-adjacent order data), Cosmos DB for `product-service` (document store, partitioned on `/categoryId` because most queries filter by category), and Azure Redis Cache for `cart-service` (sub-millisecond reads, natural TTL expiry for ephemeral cart data — a 7-day Redis hash per user, not a SQL table).
+- **Reliability via async decoupling:** `order-service` publishes an `order.placed` event to an **Azure Service Bus topic**, and both `payment-service` and `notification-service` subscribe independently. Critically, the HTTP response to the customer is returned **immediately after the order is saved to SQL** — the Service Bus publish is fire-and-forget, not awaited. That means a slow or temporarily-down downstream consumer (say, notification-service) can never make order placement itself fail or hang; SQL is the source of truth, messaging is best-effort.
+- **Secrets:** Azure Key Vault, read by pods through the **Key Vault CSI driver** via `SecretProviderClass`, with secrets auto-rotating in-pod every 2 minutes if the value changes in Key Vault — no redeploy needed to pick up a rotated secret.
+- **Environment isolation at the state level, not just the resource level:** Terraform uses a **partial backend config** — one Azure Storage container, but a separate `.tfstate` key per environment (`dev.tfstate`, `staging.tfstate`, `prod.tfstate`), so destroying the dev environment can never touch staging or prod state.
+
+**Real challenges I ran into (and the trade-offs behind them):**
+- **True zonal HA wasn't available on the subscription tier I was working with.** AKS node pools normally take a `zones = ["1","2","3"]` argument to spread nodes across Availability Zones, but the free-tier subscription only supports zone 2 in `eastus` — so that argument had to be removed, with a comment left directly in the Terraform explaining why and what to re-add on a paid subscription. This is a real trade-off I'd volunteer in an interview rather than hide: the mitigation wasn't "pretend it's fine," it was documenting the exact line to change (`zones = ["1","2","3"]`) the moment the constraint lifts, and leaning on the multi-node-pool + autoscaling design to still get *some* resilience (pod rescheduling across nodes) even without zone-level redundancy.
+- **`lifecycle { ignore_changes = [node_count] }` was required** on the autoscaling node pools — without it, every `terraform apply` would silently fight the AKS autoscaler and reset node count back to its initial Terraform value, undoing whatever the autoscaler had correctly scaled to.
+- **A circular Terraform dependency** between the AKS module and the monitoring module (AKS needs the Log Analytics workspace ID for Container Insights; the diagnostic setting needs both AKS's and monitoring's outputs) was resolved by placing the `azurerm_monitor_diagnostic_setting` resource in the root module instead of inside either child module.
+
+---
+
+**Side-by-side — how the same HA problem was solved on each cloud**
+
+```
+                    AWS — FinBank                         Azure — AzureShop
+                    ──────────────                        ──────────────────
+Internet                                                    Internet
+   │                                                            │
+   ▼                                                            ▼
+AWS ALB (one per env: dev/stage/prod)          Azure Application Gateway v2 (WAF, autoscale 1–5)
+   │                                                            │
+   ▼                                                            ▼
+EKS — 2 AZs (ap-south-1a / ap-south-1b)        AKS — system + user(autoscale) + spot node pools
+ private subnets, t3.medium nodes                NGINX ingress inside cluster (rate limiting)
+   │                                                            │
+   ▼                                                            ▼
+RDS MySQL (multi_az toggle) + ElastiCache      Azure SQL + Cosmos DB (NoSQL) + Redis Cache
+   │                                                            │
+   ▼                                                            ▼
+Secrets Manager → IRSA → External Secrets Op.  Key Vault → CSI driver (auto-rotate every 2 min)
+   │                                                            │
+   ▼                                                            ▼
+ArgoCD GitOps — auto-reconciles cluster        (Helm-based deploys via Azure Pipelines)
+ back to Git state if it ever drifts
+```
+
+| Concern | AWS (FinBank) | Azure (AzureShop) |
+|---|---|---|
+| Orchestration | EKS 1.31 | AKS |
+| Compute HA | 2-AZ subnets, HPA + PDB in prod | 3 node pools (system/user/spot), autoscaling |
+| Edge/WAF | ALB (Ingress Controller) | Application Gateway v2 + WAF (OWASP 3.2) |
+| Relational DB | RDS MySQL, `multi_az` toggle | Azure SQL |
+| Cache | ElastiCache Redis | Azure Redis Cache |
+| Secrets | Secrets Manager + IRSA + ESO | Key Vault + CSI driver, auto-rotate |
+| Deploy model | Jenkins → ECR → ArgoCD GitOps | Azure Pipelines → ACR → Helm |
+| Async reliability | — | Service Bus topic (order → payment/notification, fire-and-forget) |
+
+---
+
+**Complete thought process — how I'd walk through this live in an interview**
+
+```
+Is this really "multi-cloud" or two single-cloud projects?
+  → Be upfront: two separate builds, not one hybrid workload.
+    That's the honest and actually more credible answer.
+
+What HA decisions repeated on both clouds?
+  → Multi-AZ/multi-pool compute, a managed relational DB with
+    an HA toggle, a managed secrets store with no credentials
+    committed to Git, and per-environment isolation at both the
+    resource level (namespaces/ALBs) and the state level
+    (Terraform backend keys).
+
+What's the most senior-sounding part of this answer?
+  → Not the tool list — the TRADE-OFFS: single NAT gateway
+    in dev (cost vs. resilience), AKS zone limitation on a
+    free-tier subscription (documented mitigation, not denial),
+    fire-and-forget messaging so a downstream outage can't take
+    down order placement.
+
+What would I do differently at true production scale?
+  → One NAT gateway per AZ (FinBank), re-enable zone-redundant
+    AKS node pools on a paid subscription (AzureShop), and move
+    RDS multi_az from an optional variable to always-on.
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"My multi-cloud experience comes from building two separate production-grade platforms end-to-end — FinBank on AWS, and AzureShop on Azure — rather than one workload spanning both clouds, and I'd rather say that plainly than overstate it. On AWS, FinBank runs on EKS across two Availability Zones, with RDS Multi-AZ available as a toggle, HPA and PodDisruptionBudgets in production, secrets flowing from Secrets Manager through IRSA with zero credentials in Git, and ArgoCD doing GitOps sync so the cluster self-corrects back to what's declared in Git if it ever drifts. On Azure, AzureShop runs on AKS with separate system/user/spot node pools behind an Application Gateway WAF, uses Cosmos DB and Redis alongside Azure SQL depending on each service's actual access pattern, and gets reliability from Service Bus topic-based async messaging — order placement never blocks on a downstream service being slow. The part I'd emphasize most is the trade-offs I made deliberately and can defend: a single NAT gateway in FinBank's dev environment to control cost, and AKS zone-redundancy that had to be disabled on a free-tier subscription in AzureShop — in both cases I documented exactly what changes the moment the environment needs true production-grade resilience, rather than pretending the constraint didn't exist."*
+
+---
