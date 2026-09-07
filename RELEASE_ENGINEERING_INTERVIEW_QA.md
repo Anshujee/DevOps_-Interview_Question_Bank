@@ -11,6 +11,7 @@
   - [Q1. Have you worked with GitLab CI/CD in your project(s) — past or present?](#q1-have-you-worked-with-gitlab-cicd-in-your-projects--past-or-present)
   - [Q2. Can you explain the stages of GitLab CI/CD?](#q2-can-you-explain-the-stages-of-gitlab-cicd)
   - [Q3. What is GitLab Runner, and what's the difference between GitLab and GitLab Runner?](#q3-what-is-gitlab-runner-and-whats-the-difference-between-gitlab-and-gitlab-runner)
+  - [Q4. Walk me through a basic CI/CD pipeline](#q4-walk-me-through-a-basic-cicd-pipeline)
 
 ---
 
@@ -296,5 +297,163 @@ GitLab.com provides free **shared runners** it manages for you — fine for a po
 **Summary (what to say if time is short):**
 
 *"GitLab is the platform that hosts the code and the pipeline definition — it decides what jobs need to run and in what order, and it's where the pipeline dashboard and approval steps live. GitLab Runner is a separate agent that does the actual execution: it's registered against the project, polls for jobs, and runs the real script for each job using an executor like Docker or Kubernetes, then reports the result back. So GitLab is the orchestrator and Runner is the worker providing compute. For a banking environment specifically, I'd expect self-hosted Runners running inside the company's own network rather than GitLab's shared SaaS runners, both so jobs can reach internal systems directly and so code and secrets never leave infrastructure the company controls."*
+
+---
+
+#### Q4. Walk me through a basic CI/CD pipeline
+
+**Answer:**
+
+I'll walk through this as the actual production-grade pipeline a banking application needs in GitLab CI/CD — not the toy 3-stage `build → test → deploy` example — since that's what a banking interviewer is really probing for. Same honesty caveat as the earlier answers: the design below is built directly on the real Jenkins pipeline I run for FinBank (compile → test → SonarQube → Docker build → Trivy scan → push → Helm/ArgoCD deploy), extended with the additional banking-specific security and change-control stages a regulated environment requires. I'll say plainly which pieces I've personally operated versus designed, as I go.
+
+---
+
+**The full pipeline, as one connected story**
+
+1. **A developer pushes code** to a feature branch and opens a merge request. GitLab reads `.gitlab-ci.yml` at the repo root and creates a pipeline automatically — nothing manual triggers it.
+
+2. **Build** — the pipeline compiles the application (`mvn clean package -DskipTests` for a Java service, compiling first and fast, before anything else runs). The compiled artifact is kept as a GitLab **artifact** so later stages don't have to rebuild it.
+
+3. **Test** — automated unit tests run (`mvn test`). If a test fails, the pipeline **stops immediately** — no time is wasted building an image or running security scans against code that's already broken. In parallel, a non-blocking **SonarQube** job flags code-quality issues without hard-failing the build — a real trade-off I've made on FinBank: a code smell shouldn't block a release the way a security issue should.
+
+4. **Source-level security scanning** — this is the stage a generic answer skips and a banking interviewer specifically listens for. Three or four jobs run in parallel here, all against the source code itself, before anything gets built into an image:
+   - **SAST** (Static Application Security Testing) — scans the code for vulnerable patterns like SQL injection or unsafe deserialization (GitLab's built-in SAST template, Semgrep-based).
+   - **Secret Detection** — scans for literally committed credentials, API keys, or tokens (gitleaks or GitLab's Secret Detection). This is the one most banks treat as non-negotiable — a leaked credential is an immediate, exploitable incident, not a theoretical weakness.
+   - **Dependency Scanning (SCA)** — checks every third-party library the app pulls in against known CVE databases.
+   - **License Compliance** — flags a dependency pulled in under a license legal hasn't approved (e.g. AGPL) — routed to manual review rather than an automatic block.
+   All four of these are blocking except license compliance, and all run against **source code**, before a container image even exists.
+
+5. **Package** — only once build, tests, and source-level security scans pass does the pipeline build the deployable artifact. For a containerized app that means, in one sequential job on one runner: `docker build`, then **Trivy** scans that exact image for CRITICAL/HIGH CVEs — genuinely blocking, `--exit-code 1` — then a **Software Bill of Materials (SBOM)** gets generated so there's a signed inventory of everything in the artifact, then the image is signed with **cosign** so anyone can later prove the image running in prod is the exact one that passed every gate, and only then is it pushed to the registry, tagged with the immutable Git commit SHA — never `latest`.
+
+6. **Deploy to Dev, then QA** — the pushed image gets promoted automatically to Dev, and then QA, by updating the image tag in a GitOps repo's Helm values — the same pushed artifact, never rebuilt per environment, so what was tested is exactly what ships.
+
+7. **DAST** (Dynamic Application Security Testing) — once the app is actually running in QA, an OWASP ZAP-style scan hits the live URL looking for things you can only find in a running app — auth bypasses, exposed debug endpoints, missing security headers. This has to happen *after* a deploy, since there's nothing running to scan before that.
+
+8. **Deploy to Staging** — a pre-prod sign-off environment, typically gated behind a manual click even before production, so the release can be validated one last time under production-like conditions.
+
+9. **Change-ticket gate** — the release-engineering-specific control a bank actually asks for: before the production job is even allowed to run, a script step checks that a `CHANGE_TICKET` CI/CD variable references a ticket that's genuinely in an "Approved" state in Jira or ServiceNow — standard CAB (Change Advisory Board) practice. If that check fails, the production job is blocked outright, not just waiting on a human click.
+
+10. **Deploy to Production** — `when: manual` inside a `rules:` block, so a human has to actively click deploy in the GitLab UI, and — because of step 9 — that click is only even available once there's a provably approved change record behind it.
+
+11. **Post-deploy verify** — a scripted smoke test hits a health endpoint right after the deploy. If it fails, an automatic rollback script runs immediately; if it passes, a Slack/Teams notification and an audit log entry close out the release — the compliance-traceable record of who approved what, and when.
+
+---
+
+**The whole thing as one `.gitlab-ci.yml` skeleton**
+
+```yaml
+stages:
+  - build
+  - test
+  - security-scan
+  - package
+  - deploy-dev
+  - deploy-qa
+  - dast-scan
+  - deploy-staging
+  - deploy-prod
+  - verify
+
+variables:
+  IMAGE: registry.example.com/finbank/backend
+
+build-job:
+  stage: build
+  script: [ "mvn clean package -DskipTests" ]
+  artifacts:
+    paths: [ "target/*.jar" ]
+
+unit-test-job:
+  stage: test
+  script: [ "mvn test" ]
+
+sonarqube-job:
+  stage: test
+  script: [ "sonar-scanner" ]
+  allow_failure: true
+
+sast-job:
+  stage: security-scan
+  script: [ "semgrep ci --config auto" ]
+
+secret-detection-job:
+  stage: security-scan
+  script: [ "gitleaks detect --source . --exit-code 1" ]
+
+dependency-scan-job:
+  stage: security-scan
+  script: [ "dependency-check --project finbank --scan . --failOnCVSS 7" ]
+
+license-scan-job:
+  stage: security-scan
+  script: [ "license-finder" ]
+  allow_failure: true          # routed to manual legal review, not an auto-block
+
+package-job:
+  stage: package
+  script:
+    - docker build -t $IMAGE:$CI_COMMIT_SHORT_SHA .
+    - trivy image --exit-code 1 --severity CRITICAL,HIGH $IMAGE:$CI_COMMIT_SHORT_SHA
+    - syft $IMAGE:$CI_COMMIT_SHORT_SHA -o cyclonedx-json > sbom.json
+    - cosign sign --key cosign.key $IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $IMAGE:$CI_COMMIT_SHORT_SHA   # only reached if every line above succeeded
+  artifacts:
+    paths: [ "sbom.json" ]
+
+deploy-dev-job:
+  stage: deploy-dev
+  script: [ "./scripts/bump-helm-tag.sh dev $CI_COMMIT_SHORT_SHA" ]
+  environment: { name: dev }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+deploy-qa-job:
+  stage: deploy-qa
+  script: [ "./scripts/bump-helm-tag.sh qa $CI_COMMIT_SHORT_SHA" ]
+  environment: { name: qa }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+dast-job:
+  stage: dast-scan
+  script: [ "zap-baseline.py -t $QA_URL" ]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+deploy-staging-job:
+  stage: deploy-staging
+  script: [ "./scripts/bump-helm-tag.sh staging $CI_COMMIT_SHORT_SHA" ]
+  environment: { name: staging }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+change-ticket-gate:
+  stage: deploy-prod
+  script: [ './scripts/verify-change-ticket.sh "$CHANGE_TICKET"' ]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy-prod-job:
+  stage: deploy-prod
+  needs: [ "change-ticket-gate" ]
+  script: [ "./scripts/bump-helm-tag.sh prod $CI_COMMIT_SHORT_SHA" ]
+  environment: { name: production }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+post-deploy-verify:
+  stage: verify
+  script: [ "./scripts/smoke-test.sh production || ./scripts/rollback.sh production" ]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+```
+
+---
+
+**Summary (what to say if time is short):**
+
+*"A basic pipeline is code push → build → test → package → deploy, but for a banking application I'd extend that with security gates at every layer: SAST and secret detection on the source code itself, dependency and license scanning for third-party risk, a container image scan plus an SBOM and signature on the built artifact, and DAST against the running app once it's deployed to QA. The same pushed artifact then promotes through Staging and Production without ever being rebuilt, and production specifically is gated behind two things, not one — a manual click, and a change-ticket check that confirms a real, approved change record authorized the deploy. After deploying, a smoke test either confirms the release is healthy or triggers an automatic rollback. The gates I've actually operated in production are SonarQube and Trivy on FinBank's Jenkins pipeline; the rest — SAST, secret detection, SCA, DAST, SBOM/signing, and the change-ticket gate — I'm describing as the complete, correct design for a regulated environment, and I'd say so directly if asked which parts I've personally run."*
 
 ---
