@@ -15,6 +15,7 @@
   - [Q5. What happens when a CI/CD pipeline fails before production?](#q5-what-happens-when-a-cicd-pipeline-fails-before-production)
   - [Q6. What happens when a CI/CD pipeline fails during production?](#q6-what-happens-when-a-cicd-pipeline-fails-during-production)
   - [Q7. How do you troubleshoot a failed CI/CD pipeline?](#q7-how-do-you-troubleshoot-a-failed-cicd-pipeline)
+  - [Q8. How do you decide whether a release is ready for production or not?](#q8-how-do-you-decide-whether-a-release-is-ready-for-production-or-not)
 
 ---
 
@@ -571,5 +572,45 @@ Push the fix, confirm the pipeline goes green, and if the failure was a genuine 
 **Summary (what to say if time is short):**
 
 *"First I go straight to the specific job that's red in the pipeline graph and read its log to find the actual line that exited non-zero — not just 'it failed.' Then I classify it: is this a real code/test bug, a `.gitlab-ci.yml` config mistake — which GitLab's CI Lint tool catches before it even runs — a runner or missing-secret issue, a security gate correctly doing its job, an external dependency being down, or a flaky test. Each of those has a different fix, so I don't just retry blindly. For anything the log doesn't fully explain, GitLab has a debug trace mode that dumps every command executed, and an interactive web terminal into a running job for real-time debugging — the same instinct as reading Jenkins console output, just different tooling. Once it's fixed, I push, confirm it's green, and if it was a flake or a config mistake likely to recur, I make sure that's actually understood and fixed, not just retried away."*
+
+---
+
+#### Q8. How do you decide whether a release is ready for production or not?
+
+**Answer:**
+
+I'd split this into two layers, because they're decided by two different things — one is binary and automated, the other is contextual and needs a human — and conflating them is how releases go wrong.
+
+**Layer 1 — is the artifact itself safe? (the pipeline already answered this, no debate needed)**
+
+If any blocking gate in the pipeline failed — unit tests, SAST, secret detection, dependency scan, the Trivy container scan, DAST — the release simply **isn't a candidate** for production; this isn't a judgment call to weigh, it's already a "no" by construction, exactly as covered in Q5. So by the time a release even reaches the readiness question, every blocking gate has already passed. What's worth a second look before signing off, even though it didn't block the pipeline:
+
+- **Non-blocking warnings** — a SonarQube "unstable" flag or a license-compliance manual-review flag didn't stop the pipeline, but I'd actually glance at what they found before approving, rather than treating "didn't block" as "doesn't matter."
+- **Same artifact, promoted, not rebuilt** — confirm this is literally the same image SHA that was validated in QA/Staging, not a fresh rebuild — the whole point of build-once-promote-everywhere is that what was tested is what ships.
+
+**Layer 2 — is *now* the right time, and are we ready if it goes wrong? (this is where actual judgment happens)**
+
+| Question | Why it matters |
+|---|---|
+| Has this exact artifact soaked in Staging for a reasonable bake period with no issues? | Catches problems that only show up after some real running time, not just at deploy |
+| Is there a real, tested rollback path for this specific change — not a generic one? | Echoed from Q6: a rollback plan invented under pressure during an incident is much worse than one that already exists |
+| If this release includes a database migration, is it backward-compatible? | The app has to run correctly against both the old and new schema during a rolling deploy — an irreversible or breaking migration changes the entire risk calculus and often needs a different rollout approach (expand/contract pattern) |
+| Does the deployment strategy match the risk of the change? | A small config tweak might be fine as a plain rolling update; a payments-critical change deserves a canary with close monitoring, or at minimum extra attention during the bake period |
+| Are the dashboards/alerts that would actually catch a bad release already in place? | No point shipping something you can't observe — the alert has to exist *before* the deploy, not get added after an incident |
+| Is there an approved change ticket referencing this exact release? | The CAB gate from Q4 — production shouldn't be reachable at all without this |
+| Does the timing avoid a freeze window or a high-risk period? | Banks specifically avoid non-critical deploys around month-end/quarter-end settlement, salary-credit days, or other high-transaction-volume windows — timing is part of the risk, not separate from it |
+| Is on-call actually available and aware a deploy is happening? | A release going out right before a weekend or holiday with no one watching is a readiness failure even if the artifact itself is perfect |
+
+**How this maps onto the GitLab pipeline concretely:** Layer 1 is enforced automatically — the pipeline itself won't even let the `deploy-prod` stage become reachable unless every blocking gate passed. Layer 2 is exactly what the change-ticket gate plus `when: manual` are *for* — the human clicking deploy in GitLab is confirming the Layer 2 checklist, not re-verifying the Layer 1 gates the pipeline already checked. In practice, for anything non-trivial, I'd want a short, structured **Release Readiness Review** — a quick checklist each relevant owner confirms (Dev: code/tests, QA: sign-off, Ops/SRE: rollback + monitoring ready, Change Management: ticket approved) — rather than one person eyeballing a dashboard and guessing.
+
+---
+
+**Honest framing on where I've actually applied this:** on a personal project like FinBank, this decision is effectively made by me alone — green pipeline plus a quick sanity check of what changed is genuinely sufficient at that scale, since there's no separate QA team or CAB process. What I've described above — a distributed Release Readiness Review with separate Dev/QA/Ops/Change-Management sign-off — is the correct structure for an actual banking team, and I understand exactly why each piece exists, but I haven't personally chaired that process at that scale yet. I'd rather be precise about that than imply I've run formal go/no-go meetings I haven't.
+
+---
+
+**Summary (what to say if time is short):**
+
+*"I think about it as two layers. The first is whether the artifact itself is safe — that's already answered automatically by the pipeline, since every blocking security and quality gate has to pass before a release is even a candidate, so there's no judgment call there. The second layer is whether now is the right time and whether we're ready to respond if something goes wrong — has this exact artifact soaked in staging, is there a tested rollback path for this specific change, does the deployment strategy match the risk, are the right alerts already in place, is there an approved change ticket, and does the timing avoid a freeze window or a moment when nobody's watching. The pipeline enforces the first layer automatically; the change-ticket check and the manual approval before production are specifically there to confirm the second layer, which needs an actual human, not just a green pipeline."*
 
 ---
