@@ -14,6 +14,7 @@
   - [Q4. Walk me through a basic CI/CD pipeline](#q4-walk-me-through-a-basic-cicd-pipeline)
   - [Q5. What happens when a CI/CD pipeline fails before production?](#q5-what-happens-when-a-cicd-pipeline-fails-before-production)
   - [Q6. What happens when a CI/CD pipeline fails during production?](#q6-what-happens-when-a-cicd-pipeline-fails-during-production)
+  - [Q7. How do you troubleshoot a failed CI/CD pipeline?](#q7-how-do-you-troubleshoot-a-failed-cicd-pipeline)
 
 ---
 
@@ -525,5 +526,50 @@ Here the new version is live and potentially already serving some traffic. The r
 **Summary (what to say if time is short):**
 
 *"It depends which of two things actually happened. If the deploy job itself fails — a bad Helm upgrade, a timeout — a correctly configured rolling update means the readiness probe never passes for the new version, traffic never routes to it, and the old version keeps serving, so users see nothing. The dangerous case is when the deploy succeeds but the new version is actually broken — there I'd want an automated smoke test to catch it and trigger a rollback immediately, and for anything caught later by monitoring, the fastest safe path is reverting the Git commit that bumped the image tag so GitOps syncs back to the last known-good version automatically, or a direct `helm rollback` if it's urgent. In parallel with the technical rollback, a banking environment also needs the process side handled: the incident gets a postmortem, the change ticket that gated the original deploy gets updated with what actually happened, and there's a full audit trail of who rolled back what and when. I'll say directly that the automated-rollback piece is something I've designed here, not something running in my real Jenkins pipeline today — that's a genuine, already-known gap on my end, not something I'm papering over."*
+
+---
+
+#### Q7. How do you troubleshoot a failed CI/CD pipeline?
+
+**Answer:**
+
+I approach this the same disciplined way regardless of tool — Jenkins console output or a GitLab job log, the debugging instinct is identical: **don't guess, read the actual error, and work outward from the exact line that failed.** The mechanics below are GitLab-specific; the muscle memory underneath them is the same one I use reading Jenkins console output on FinBank today.
+
+---
+
+**Step 1 — find exactly where it broke, not just that it broke**
+
+GitLab's pipeline graph view shows the stage/job that's red at a glance — click straight into that job's log rather than starting from the top of the pipeline. The job log is the full script output for that one job; scroll to the actual non-zero exit near the bottom, since the real error is often buried under normal verbose output above it, not the first suspicious-looking line you see.
+
+**Step 2 — classify the failure before trying to fix anything**
+
+Almost every pipeline failure falls into one of these categories, and each has a genuinely different fix — treating all of them as "just retry" wastes time and treating all of them as "code bug" wastes time in the opposite direction:
+
+| Category | What it looks like | How I'd confirm it | Fix |
+|---|---|---|---|
+| **Actual code/test failure** | A specific assertion or compile error in the log | The stack trace names a real file/line | Fix the code, push, let the pipeline rerun |
+| **`.gitlab-ci.yml` config error** | Pipeline fails to even *start*, or a job errors before running any script | GitLab's **CI Lint** tool (Pipelines → Editor → Validate, or the `/-/ci/lint` page) — validates the YAML before it ever runs | Fix the YAML — common ones: a `stage:` not declared in the top-level `stages:` list, or `when:` used alongside `rules:` on the same job (GitLab rejects that combination outright) |
+| **Runner/environment issue** | Job never starts, or fails immediately with something unrelated to the app (e.g. "docker: command not found") | Check the runner's status and its registered `tags:` against the job's `tags:` — a Docker-only job landing on a shell-executor runner fails this way | Fix runner tags/scoping, or check if the runner itself is offline/out of disk |
+| **Missing or misscoped secret** | Auth failure that looks unrelated to the actual change (e.g. "403" pushing to the registry) | Check Settings → CI/CD → Variables — a variable marked **Protected** is only exposed to pipelines running on a protected branch; a feature-branch pipeline silently doesn't get it | Un-protect the variable if it genuinely needs to run on feature branches, or confirm the branch should be protected instead |
+| **Security gate doing its job correctly** | Trivy/SAST/secret-detection job fails on purpose | Read the actual scan report, don't just see "failed" and assume it's broken tooling | Fix the real finding, or — only for genuinely unfixable CVEs — document a `.trivyignore`/`--ignore-unfixed` waiver, never silently disable the gate |
+| **External dependency/service down** | Timeout pulling from a registry, npm/Maven repo, or (in the banking pipeline from Q4) the Jira/ServiceNow change-ticket API | Check the target service's status directly, not just retry blindly | Retry once to rule out a blip; if it's a genuine outage, that's now a dependency incident, not a pipeline bug |
+| **Flaky/non-deterministic test** | Fails intermittently, unrelated to the actual diff | Re-run the same commit — if it passes on retry with no code change, that's the signature | Don't just keep retrying forever — a test that's flaky enough to need retries regularly needs to actually be fixed, or it quietly trains the team to stop trusting red pipelines |
+
+**Step 3 — use GitLab's built-in tooling to go deeper when the log alone isn't enough**
+
+- **Artifacts + the Tests tab** — if JUnit XML is uploaded as a job artifact, GitLab renders it directly as a pass/fail breakdown per test in the merge request, instead of making you grep raw log text for which of 200 tests actually failed.
+- **Retry a single job** — GitLab lets you retry just the failed job without re-running everything upstream that already passed, the same time-saver as re-running a single failed stage in Jenkins instead of the whole build.
+- **`CI_DEBUG_TRACE: "true"`** — a built-in verbose mode that dumps every shell command the runner actually executes, useful when the script's own output doesn't explain *why* it behaved the way it did. Worth a caution alongside it: debug trace can print secret values into the log, so it should only be enabled temporarily, and GitLab requires it to be explicitly allowed per-project for exactly that reason.
+- **Interactive web terminal** — for supported executors, GitLab can open a live terminal into a *running* job, which is the closest equivalent to SSHing onto a Jenkins agent mid-build to poke around instead of only reading logs after the fact.
+
+**Step 4 — fix, verify, and don't stop at green**
+
+Push the fix, confirm the pipeline goes green, and if the failure was a genuine flake or a config mistake that could recur, treat it the same way I'd treat any recurring reliability issue — worth a short note on *why* it happened, not just that it's fixed now, especially if it's the kind of thing that could block a release again right before a deadline.
+
+---
+
+**Summary (what to say if time is short):**
+
+*"First I go straight to the specific job that's red in the pipeline graph and read its log to find the actual line that exited non-zero — not just 'it failed.' Then I classify it: is this a real code/test bug, a `.gitlab-ci.yml` config mistake — which GitLab's CI Lint tool catches before it even runs — a runner or missing-secret issue, a security gate correctly doing its job, an external dependency being down, or a flaky test. Each of those has a different fix, so I don't just retry blindly. For anything the log doesn't fully explain, GitLab has a debug trace mode that dumps every command executed, and an interactive web terminal into a running job for real-time debugging — the same instinct as reading Jenkins console output, just different tooling. Once it's fixed, I push, confirm it's green, and if it was a flake or a config mistake likely to recur, I make sure that's actually understood and fixed, not just retried away."*
 
 ---
