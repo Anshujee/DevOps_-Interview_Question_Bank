@@ -12,6 +12,8 @@
   - [Q2. Can you explain the stages of GitLab CI/CD?](#q2-can-you-explain-the-stages-of-gitlab-cicd)
   - [Q3. What is GitLab Runner, and what's the difference between GitLab and GitLab Runner?](#q3-what-is-gitlab-runner-and-whats-the-difference-between-gitlab-and-gitlab-runner)
   - [Q4. Walk me through a basic CI/CD pipeline](#q4-walk-me-through-a-basic-cicd-pipeline)
+  - [Q5. What happens when a CI/CD pipeline fails before production?](#q5-what-happens-when-a-cicd-pipeline-fails-before-production)
+  - [Q6. What happens when a CI/CD pipeline fails during production?](#q6-what-happens-when-a-cicd-pipeline-fails-during-production)
 
 ---
 
@@ -455,5 +457,73 @@ post-deploy-verify:
 **Summary (what to say if time is short):**
 
 *"A basic pipeline is code push → build → test → package → deploy, but for a banking application I'd extend that with security gates at every layer: SAST and secret detection on the source code itself, dependency and license scanning for third-party risk, a container image scan plus an SBOM and signature on the built artifact, and DAST against the running app once it's deployed to QA. The same pushed artifact then promotes through Staging and Production without ever being rebuilt, and production specifically is gated behind two things, not one — a manual click, and a change-ticket check that confirms a real, approved change record authorized the deploy. After deploying, a smoke test either confirms the release is healthy or triggers an automatic rollback. The gates I've actually operated in production are SonarQube and Trivy on FinBank's Jenkins pipeline; the rest — SAST, secret detection, SCA, DAST, SBOM/signing, and the change-ticket gate — I'm describing as the complete, correct design for a regulated environment, and I'd say so directly if asked which parts I've personally run."*
+
+---
+
+#### Q5. What happens when a CI/CD pipeline fails before production?
+
+**Answer:**
+
+Before production, a failure is cheap — nothing has reached a real user yet, so the entire response is "stop, notify, fix, rerun." The specific mechanics, in GitLab terms:
+
+**1. The pipeline halts exactly at the failing job — nothing downstream runs.** GitLab stages run in order, and the next stage only starts once every job in the current one succeeds. So if `unit-test-job` fails in the `test` stage, `security-scan`, `package`, and every `deploy-*` stage after it simply never execute — no image gets built, nothing gets pushed, nothing gets promoted anywhere. The blast radius is zero by construction, not by luck.
+
+**2. Not every failure blocks — the pipeline distinguishes blocking from non-blocking.** A job like `sonarqube-job` or `license-scan-job` is marked `allow_failure: true`: it shows up as a visible, orange "failed (allowed to fail)" warning, but the pipeline keeps going. A job like `unit-test-job`, `sast-job`, `secret-detection-job`, or the Trivy line inside `package-job` has no such flag — those are genuinely blocking. That split is a deliberate design decision I've actually made on FinBank's real Jenkins pipeline (SonarQube non-blocking, Trivy blocking) for exactly the same reasoning: a code smell shouldn't stop a release the way an exploitable CVE or a leaked credential should.
+
+**3. Merging is blocked at the source, not just the pipeline.** In GitLab, a protected branch can require "pipelines must succeed" as a merge condition — so even before anyone manually checks, a merge request with a red pipeline literally cannot be merged into `main`. That's the mechanism that turns "the test failed" into "this code cannot reach production," automatically.
+
+**4. Notification is immediate, and fixing is fast to retry.** GitLab marks the job red in the UI, and typically that's wired to Slack/email/MR comments so the developer knows within minutes, not at the next standup. A genuinely useful detail worth mentioning: GitLab lets you **retry just the single failed job** without re-running every job that already passed — so if `dependency-scan-job` failed while `build-job` and `unit-test-job` already succeeded, fixing the dependency and hitting retry doesn't waste time recompiling and re-testing.
+
+**5. One banking-specific nuance worth raising unprompted:** if the failure is specifically `secret-detection-job` catching a real committed credential, "it never reached production" doesn't mean the incident is over — that credential still exists in the branch's git history at the point it was committed. The correct response isn't just "remove it and continue," it's **remove it and rotate the actual credential**, since a real value briefly existed in a repository regardless of whether the pipeline ever let it ship anywhere. I've done exactly this for real on FinBank — a self-audit caught plaintext DB passwords and a JWT secret committed to a `.env` file — and the fix was purge-from-git plus full credential rotation, not just deleting the file going forward.
+
+---
+
+**Summary (what to say if time is short):**
+
+*"Before production, a pipeline failure is contained by design — the pipeline stops at that stage, nothing downstream builds or deploys, so nothing reaches a real user. Non-blocking checks like SonarQube are allowed to fail and just show a warning; genuinely blocking checks like unit tests, SAST, secret detection, or the Trivy image scan stop the pipeline outright, and GitLab's protected-branch setting means a merge request with a failing pipeline literally can't be merged. The developer gets notified immediately, fixes the issue, and either reruns the whole pipeline or retries just the failed job without re-running what already passed. The one exception where 'it never reached prod' doesn't mean 'nothing to do' is a caught secret — that credential still existed in git history, so the real fix is removing it and rotating the credential, which is exactly what I had to do for a real leaked `.env` file on FinBank."*
+
+---
+
+#### Q6. What happens when a CI/CD pipeline fails during production?
+
+**Answer:**
+
+This is a fundamentally different situation from Q5 — real users may be affected, so the priority order flips from "fix the root cause" to "stop the bleeding first, understand it second." I'd split this into two distinct failure modes, because the right response is different for each, and being able to draw that distinction is exactly what a banking interviewer is listening for.
+
+---
+
+**Mode 1 — the `deploy-prod` job itself fails (Helm upgrade error, connection timeout, bad manifest)**
+
+If it's configured correctly, this is actually the *safe* outcome: a Kubernetes rolling update only sends traffic to a new pod once its **readiness probe** passes. If the new version fails to come up healthy, the readiness check simply never passes, traffic never routes to it, and the old pods — which were never torn down — keep serving every request. The deploy job shows red in GitLab, but from a user's perspective, **nothing happened**. This is real behavior I rely on today on FinBank: a bad build fails its readiness check and traffic simply never reaches it, instead of users hitting a broken pod.
+
+---
+
+**Mode 2 — the deploy succeeds, but the new version is actually broken (the dangerous case)**
+
+Here the new version is live and potentially already serving some traffic. The response has three layers, roughly in order of how fast they can act:
+
+1. **Immediate, automated** — the `post-deploy-verify` smoke test I built into the Q4 pipeline hits a health endpoint right after deploy; if it fails, it triggers a rollback script automatically, before a human even needs to be paged. If the deployment strategy is canary (via Argo Rollouts or similar) rather than a plain rolling update, this can go further — an `AnalysisTemplate` continuously queries a live Prometheus metric like error rate, and if it crosses a threshold during the 20%-traffic canary step, the rollout aborts and reverts automatically, so only a small slice of traffic was ever exposed.
+
+2. **Fast, human-triggered rollback** — if something only surfaces after the smoke test already passed (a real production incident, not something the deploy gate caught), the fastest safe options, in order of how I'd actually reach for them:
+   - **Revert the Git commit** in the GitOps/infra repo that bumped the image tag — ArgoCD (or Flux) detects that revert and syncs the cluster back to the previous known-good version automatically. This is the cleanest option because it's auditable — the rollback is itself a normal, reviewed git commit, not an untracked manual action.
+   - **`helm rollback <release> <previous-revision>`** directly, if the situation is urgent enough that waiting on GitOps reconciliation isn't acceptable.
+   - **`kubectl rollout undo deployment/<name>`** as the last-resort, break-glass option.
+   In GitLab specifically, the `environment:` block also gives a one-click **"Re-deploy"** button in the Deployments UI against any previous successful deployment — a native rollback path without touching a terminal at all.
+
+3. **Incident process, in parallel with the technical rollback** — this is the part that's specific to a bank rather than a generic outage:
+   - The alert that caught it (a Prometheus `HighErrorRate`-style alert, paging on-call) starts a real incident: severity assigned, stakeholders notified, a postmortem/RCA scheduled.
+   - The **change ticket** that gated the original deploy (from Q4's change-ticket gate) gets updated with the actual outcome — rolled back, root cause, fix ETA — because the CAB record has to reflect what actually happened, not just what was approved to happen.
+   - There's a full **audit trail**: who triggered the rollback, exactly when, and why — this is a hard requirement in banking, not a nice-to-have, since a regulator or internal audit can ask for this history well after the fact.
+   - Depending on customer impact and how the bank's compliance function is set up, a production incident touching a customer-facing banking service can trigger **formal incident/SLA-breach reporting obligations** — I don't have hands-on experience with that specific regulatory reporting step, but I know it's a real downstream consequence in this domain and I'd defer to the compliance/incident-management process already in place rather than guess at it.
+
+---
+
+**The honest gap, stated directly:** the automated rollback step in `post-deploy-verify` is something I've designed for this pipeline, not something running in FinBank's real Jenkins pipeline today — that pipeline currently has no automated rollback wired up at all; a rollback there would still be a manual `helm rollback` or redeploying the previous tag by hand. It's a known, already-identified gap on my own list, not something I'm discovering for the first time in this answer.
+
+---
+
+**Summary (what to say if time is short):**
+
+*"It depends which of two things actually happened. If the deploy job itself fails — a bad Helm upgrade, a timeout — a correctly configured rolling update means the readiness probe never passes for the new version, traffic never routes to it, and the old version keeps serving, so users see nothing. The dangerous case is when the deploy succeeds but the new version is actually broken — there I'd want an automated smoke test to catch it and trigger a rollback immediately, and for anything caught later by monitoring, the fastest safe path is reverting the Git commit that bumped the image tag so GitOps syncs back to the last known-good version automatically, or a direct `helm rollback` if it's urgent. In parallel with the technical rollback, a banking environment also needs the process side handled: the incident gets a postmortem, the change ticket that gated the original deploy gets updated with what actually happened, and there's a full audit trail of who rolled back what and when. I'll say directly that the automated-rollback piece is something I've designed here, not something running in my real Jenkins pipeline today — that's a genuine, already-known gap on my end, not something I'm papering over."*
 
 ---
