@@ -10,6 +10,7 @@
 - [Interview #1 — Banking Domain Client | Release Engineer | Technical Round](#interview-1)
   - [Q1. Have you worked with GitLab CI/CD in your project(s) — past or present?](#q1-have-you-worked-with-gitlab-cicd-in-your-projects--past-or-present)
   - [Q2. Can you explain the stages of GitLab CI/CD?](#q2-can-you-explain-the-stages-of-gitlab-cicd)
+  - [Q3. What is GitLab Runner, and what's the difference between GitLab and GitLab Runner?](#q3-what-is-gitlab-runner-and-whats-the-difference-between-gitlab-and-gitlab-runner)
 
 ---
 
@@ -258,5 +259,42 @@ Build → Unit Test → [SAST | Secret Detection | Dependency Scan | License Sca
 **Extended answer, if they push specifically for a banking-grade list:**
 
 *"For a regulated banking environment I'd add security gates at every layer, not just the container image: SAST and secret detection on the source code itself, dependency/SCA scanning for vulnerable third-party libraries, license compliance for legal, then the container scan, an SBOM and image signing so you can prove exactly what's running in production, DAST against the deployed app before it reaches staging, and — the release-engineering-specific piece — a change-ticket gate before production that checks a Jira or ServiceNow ticket is actually in an approved state, not just a human clicking `when: manual`. I want to be upfront that SonarQube and Trivy are the two gates I've actually run in production; the rest — SAST, secret detection, DAST, SBOM/signing, the change-ticket gate — I know precisely why each one matters and where it sits in the pipeline, but I'm describing the complete design rather than claiming I've operated all of them personally."*
+
+---
+
+#### Q3. What is GitLab Runner, and what's the difference between GitLab and GitLab Runner?
+
+**Answer:**
+
+**GitLab** is the platform itself — it hosts the source code, the merge requests, and the pipeline *definition*. The `.gitlab-ci.yml` file lives in the repo, and GitLab reads it to know what stages and jobs exist, in what order, and under what conditions each one should run. GitLab is the **orchestrator** — it decides *what* needs to happen and *when*, and it's where you see the pipeline dashboard, logs, and approval buttons.
+
+**GitLab Runner** is a separate, lightweight agent that does the actual **execution**. GitLab itself never runs `mvn test` or `docker build` — it just makes a job available. GitLab Runner is the program that picks that job up, runs the real shell commands on some actual compute — a VM, a Docker container, or a Kubernetes pod — and reports the result (pass/fail, full logs) back to GitLab.
+
+**In one line:** GitLab is where the pipeline is defined and tracked; GitLab Runner is the agent that actually provides the compute to run each job.
+
+---
+
+**How they actually talk to each other**
+
+1. A Runner is **registered** against a project, a group, or the whole GitLab instance, using a registration token.
+2. The Runner continuously polls GitLab (or is notified) asking "any jobs waiting for me?"
+3. When a pipeline triggers, GitLab queues each job and hands it to any available, matching Runner (matching can be scoped by **tags** — e.g. a job tagged `docker` only goes to a Runner that's registered with that tag).
+4. The Runner executes the job's `script:` lines using its configured **executor** — `shell` (runs directly on the Runner's host), `docker` (runs inside a container per job — the most common choice), or `kubernetes` (runs as a pod in a cluster).
+5. Logs stream back to GitLab in real time, and the final pass/fail result updates the pipeline dashboard.
+
+---
+
+**Shared Runners vs. self-hosted Runners — the part worth raising unprompted in a banking interview**
+
+GitLab.com provides free **shared runners** it manages for you — fine for a portfolio project, zero setup. A bank will almost always require **self-hosted Runners** instead, registered inside the company's own private network, for two concrete reasons:
+
+- **Network access:** jobs often need to reach internal systems directly — an internal database, an internal artifact repository, an internal deployment target sitting in a private subnet. A shared, public Runner outside the company's network simply can't reach those.
+- **Compliance/data residency:** a bank generally can't have its source code, build artifacts, or secrets ever touch infrastructure it doesn't control or audit — which shared SaaS runners don't satisfy.
+
+---
+
+**Summary (what to say if time is short):**
+
+*"GitLab is the platform that hosts the code and the pipeline definition — it decides what jobs need to run and in what order, and it's where the pipeline dashboard and approval steps live. GitLab Runner is a separate agent that does the actual execution: it's registered against the project, polls for jobs, and runs the real script for each job using an executor like Docker or Kubernetes, then reports the result back. So GitLab is the orchestrator and Runner is the worker providing compute. For a banking environment specifically, I'd expect self-hosted Runners running inside the company's own network rather than GitLab's shared SaaS runners, both so jobs can reach internal systems directly and so code and secrets never leave infrastructure the company controls."*
 
 ---
