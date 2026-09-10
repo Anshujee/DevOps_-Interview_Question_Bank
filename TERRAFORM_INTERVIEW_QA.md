@@ -40,6 +40,7 @@
   - [Q4. Create 10 EC2 instances with the same configuration but different names — one by one, or is there an optimization?](#q4-suppose-you-want-to-create-10-aws-ec2-instances-with-the-same-cpu-memory-and-other-configuration-but-only-the-name-is-different-would-you-create-them-one-by-one-or-is-there-an-optimization-technique)
   - [Q5. How can you make Terraform plan/apply fail if the Resource Group name is not exactly 10 characters?](#q5-how-can-you-make-terraform-planapply-fail-if-the-resource-group-name-is-not-exactly-10-characters)
   - [Q6. Where does Terraform variable validation happen — during plan or apply?](#q6-where-does-terraform-variable-validation-happenduring-plan-or-apply)
+  - [Q7. How would you manage Dev, QA and Prod using Terraform?](#q7-how-would-you-manage-dev-qa-and-prod-using-terraform)
 
 ---
 
@@ -6202,6 +6203,86 @@ principle as the container image build-once pipeline (DevOps Q4)
 **Summary (what to say if time is short):**
 
 *"Effectively, validation happens at plan time — right after Terraform resolves the input variables, before it builds the resource graph or contacts any provider, which is what makes it fail-fast. The nuance is that it depends on how apply is actually invoked. A bare terraform apply with no plan file runs its own internal plan first, so validation is checked at that same point. But terraform apply against a saved plan file — the standard pattern in a real CI/CD pipeline, where plan runs in one stage and apply runs a separate, later stage against that saved artifact — does not re-run validation at all, because the plan it's executing was already fully validated when it was generated. So in a pipeline like that, a validation failure will only ever show up during the plan stage, which is actually the design goal — it means a reviewer sees the failure on the PR before anyone approves anything, never as a surprise during apply. Worth mentioning too that terraform validate runs these same checks even earlier, without needing a full plan, as long as the variables have concrete values available to it — useful as a fast, local, or pre-commit check."*
+
+---
+
+#### Q7. How would you manage Dev, QA and Prod using Terraform?
+
+**Answer:**
+
+The core principle: **one set of Terraform modules, reused for every environment — never separate copies of the code per environment.** What actually differs between Dev, QA, and Prod is (1) the input *values* and (2) the *state file* each environment's resources are tracked in. If I ever find myself with a `modules/eks-dev/` folder and a `modules/eks-prod/` folder, that's the signal something's structured wrong — the module should be identical, and only the values feeding into it should change.
+
+---
+
+**1. Same module, different values — via `.tfvars` per environment**
+
+```
+aws/terraform/
+├── main.tf                        # wires modules together — identical for every environment
+├── environments/
+│   ├── dev/terraform.tfvars       # small instance sizes, 1 replica
+│   ├── qa/terraform.tfvars        # closer to prod sizing, for realistic testing
+│   └── prod/terraform.tfvars      # full sizing, Multi-AZ enabled
+└── modules/
+    ├── vpc/   eks/   rds/   ecr/
+```
+
+```hcl
+# main.tf — never changes between dev/qa/prod
+module "eks" {
+  source        = "./modules/eks"
+  environment   = var.environment        # "dev" / "qa" / "prod" — comes from tfvars
+  node_min_size = var.eks_node_min_size  # small in dev, larger in prod
+  node_max_size = var.eks_node_max_size
+}
+```
+
+```bash
+terraform plan -var-file="environments/qa/terraform.tfvars"
+terraform apply -var-file="environments/prod/terraform.tfvars"
+```
+
+**2. A separate state file per environment — the part that actually keeps them safe from each other**
+
+This is the more important half of the question, and the part people often get wrong by reaching for Terraform **workspaces**. Workspaces let the same backend config produce a separate state file per `terraform workspace select dev/qa/prod` — simple to set up, but risky for anything prod-critical, because it's entirely possible to `apply` while sitting in the wrong workspace by mistake, with no structural barrier stopping it.
+
+The pattern I actually use on both real projects instead is a **partial backend configuration** — the shared connection details live in `backend.tf`, but the state file `key` is deliberately left out of the code and supplied explicitly per environment at `init` time:
+
+```hcl
+# backend.tf — shared, no key hardcoded
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-azureshop-dev"
+    storage_account_name = "myprojectazshoptfstate"
+    container_name       = "tfstate"
+    # key is supplied per environment, not hardcoded here
+  }
+}
+```
+
+```bash
+terraform init -backend-config="environments/dev/backend.hcl"   # key = "dev.tfstate"
+terraform init -backend-config="environments/qa/backend.hcl"    # key = "qa.tfstate"
+terraform init -backend-config="environments/prod/backend.hcl"  # key = "prod.tfstate"
+```
+
+One storage account, one container, but each environment gets a **completely separate, physically distinct state blob** — not just a logical separation. Running `terraform destroy` against Dev can never touch QA or Prod's state, because it's a different file, not just a different workspace label sitting on top of the same one. That's the structural safety workspaces don't give you.
+
+**Honest gap, stated directly:** AzureShop is actually built this correct way today; FinBank currently has the `key` hardcoded directly in its backend block (`key = "finbank/dev/terraform.tfstate"`), which is exactly why only a `dev` environment exists for that project right now — extending it to QA/Prod safely means stripping that hardcoded key out and adopting the same `-backend-config`-per-environment pattern AzureShop already uses. I'd say this directly if asked, rather than imply both projects already do this correctly.
+
+**3. State locking, so concurrent applies can't corrupt anything**
+
+Both backends — S3+DynamoDB on AWS, Azure Blob's native lease-based locking — prevent two people, or a person and a CI pipeline, from running `apply` against the same environment's state at the same moment and corrupting it. This matters more as more environments and more people are involved, not less.
+
+**4. Promotion through environments in CI/CD — same code, reviewed once, applied with different values**
+
+`terraform plan` runs on every pull request against the target environment's `.tfvars`, so a reviewer sees exactly what will change before approving — the same "review before it happens, not after" principle as the container image pipeline (DevOps Q4), just applied to infrastructure instead of application code. On merge, `apply` runs against that same reviewed plan. QA gets promoted first with production-like sizing specifically so it catches issues Dev's smaller, cheaper sizing would miss; Prod applies last, typically behind the same kind of manual approval gate used for an application deploy.
+
+---
+
+**Summary (what to say if time is short):**
+
+*"The principle is one set of modules reused for every environment, never separate copies of the code per environment — only the input values and the state file differ. Values come from a `.tfvars` file per environment, kept out of the shared `main.tf` entirely. For state, I specifically avoid Terraform workspaces for anything prod-critical, because it's too easy to apply while sitting in the wrong workspace with no structural barrier stopping it — instead I use a partial backend configuration where the state file's `key` is supplied per environment at `init` time, so Dev, QA, and Prod get physically separate state files, not just a logical label on top of one shared file. Both real backends I've used — S3+DynamoDB and Azure Blob's native locking — also prevent concurrent applies from corrupting state. In CI/CD, plan runs on every PR against the target environment's values so a reviewer sees the exact change before approving, and apply runs against that same reviewed plan on merge — QA gets prod-like sizing specifically to catch what Dev's smaller footprint would miss, and Prod applies last behind a manual approval gate."*
 
 ---
 
